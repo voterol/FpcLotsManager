@@ -1,5 +1,6 @@
-import ast
 import unittest
+import ast
+import re
 from html import escape
 from math import isfinite
 from pathlib import Path
@@ -24,6 +25,9 @@ HELPERS = {
     "parse_lot_form_defaults",
     "unsupported_required_lot_fields",
     "parse_subcategory_ids_input",
+    "version_tuple",
+    "validate_update_source",
+    "build_update_urls",
 }
 
 
@@ -36,7 +40,12 @@ def load_helpers():
                 selected.append(node)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in HELPERS:
             selected.append(node)
-    namespace = {"escape": escape, "isfinite": isfinite, "BeautifulSoup": BeautifulSoup, "urlparse": urlparse}
+    namespace = {
+        "escape": escape, "isfinite": isfinite, "BeautifulSoup": BeautifulSoup,
+        "urlparse": urlparse, "ast": ast, "re": re,
+        "NAME": "LotsManager", "UUID": "5693f220-bcc6-4f6e-9745-9dee8664cbb2",
+        "UPDATER_OWNER": "voterol", "UPDATER_REPO": "users-voterol-fpc", "UPDATER_SOURCE_PATH": "LotsManager.py",
+    }
     module = ast.Module(body=selected, type_ignores=[])
     module.body.insert(0, ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0))
     module = ast.fix_missing_locations(module)
@@ -229,6 +238,38 @@ class HelperTests(unittest.TestCase):
         parse = self.helpers["parse_subcategory_ids_input"]
         self.assertEqual(parse("123, 456"), ([123, 456], []))
         self.assertEqual(parse("0, -1, 1234567890123, Steam"), ([], ["0", "-1", "1234567890123", "Steam"]))
+
+    def test_update_source_validation_checks_identity_and_syntax(self):
+        validate = self.helpers["validate_update_source"]
+        source = '''
+NAME = "LotsManager"
+VERSION = "1.2.3"
+UUID = "5693f220-bcc6-4f6e-9745-9dee8664cbb2"
+BIND_TO_PRE_INIT = []
+BIND_TO_DELETE = None
+'''
+        self.assertEqual(validate(source)["VERSION"], "1.2.3")
+        with self.assertRaises(ValueError):
+            validate(source.replace('NAME = "LotsManager"', 'NAME = "Other"'))
+        with self.assertRaises(SyntaxError):
+            validate(source + "if")
+        current_source = PLUGIN_PATH.read_text(encoding="utf-8")
+        self.assertEqual(validate(current_source)["VERSION"], "1.1.0")
+
+    def test_update_urls_require_immutable_commit(self):
+        build = self.helpers["build_update_urls"]
+        sha = "a" * 40
+        api_url, raw_url = build(sha)
+        self.assertEqual(api_url, "https://api.github.com/repos/voterol/users-voterol-fpc/commits?path=LotsManager.py&sha=main&per_page=1")
+        self.assertEqual(raw_url, f"https://raw.githubusercontent.com/voterol/users-voterol-fpc/{sha}/LotsManager.py")
+        with self.assertRaises(ValueError):
+            build("main")
+
+    def test_version_tuple_uses_numeric_comparison(self):
+        parse = self.helpers["version_tuple"]
+        self.assertGreater(parse("1.10.0"), parse("1.9.0"))
+        with self.assertRaises(ValueError):
+            parse("v1.0")
 
 
 if __name__ == "__main__":

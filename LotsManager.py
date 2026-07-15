@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from html import escape
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from math import isfinite
 from os import replace
 from os.path import exists
@@ -10,6 +12,10 @@ from secrets import token_hex
 from tempfile import NamedTemporaryFile
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
+import ast
+import hashlib
+import re
+import shutil
 
 import telebot
 import threading
@@ -28,7 +34,7 @@ import json
 
 
 NAME = "LotsManager"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DESCRIPTION = "Плагин для копирования и управления лотами через inline кнопки."
 CREDITS = "@woopertail, @sidor0912, @voterol (gpt5.6-sol)"
 UUID = "5693f220-bcc6-4f6e-9745-9dee8664cbb2"
@@ -38,6 +44,16 @@ SETTINGS_PAGE = False
 logger = getLogger("FPC.lots_copy_plugin")
 RUNNING = False
 LOTS_CACHE_TTL = 30
+UPDATER_SETTINGS_FILE = "storage/plugins/lots_manager_updater.json"
+UPDATER_OWNER = "voterol"
+UPDATER_REPO = "users-voterol-fpc"
+UPDATER_SOURCE_PATH = "LotsManager.py"
+UPDATER_CHECK_INTERVAL = 6 * 60 * 60
+UPDATER_MAX_BYTES = 2 * 1024 * 1024
+UPDATER_CONSENT_FINGERPRINT = "v1:github:voterol/users-voterol-fpc:main:LotsManager.py:auto-install"
+UPDATER_CB_CONSENT = "lm_upd_consent"
+UPDATER_CB_TOGGLE = "lm_upd_toggle"
+UPDATER_CB_CHECK = "lm_upd_check"
 
 
 # Callback'и для копирования
@@ -143,11 +159,65 @@ lots_cache = {
     "items": None,
     "expires_at": 0.0
 }
+updater_lock = threading.Lock()
+updater_settings = {
+    "schema": 1,
+    "consent": "unknown",
+    "enabled": False,
+    "last_checked_at": 0,
+    "last_commit": None,
+    "last_version": None,
+    "consent_fingerprint": None,
+}
 
 
 def html_text(value: object) -> str:
     """Escape untrusted text before embedding it in Telegram HTML."""
     return escape(str(value), quote=True)
+
+
+def version_tuple(value: str) -> tuple[int, ...]:
+    if not re.fullmatch(r"\d+\.\d+\.\d+", str(value or "")):
+        raise ValueError("invalid version")
+    return tuple(int(part) for part in str(value).split("."))
+
+
+def validate_update_source(source: str) -> dict:
+    """Validate plugin identity and syntax without executing downloaded code."""
+    if not isinstance(source, str) or not source or "\x00" in source:
+        raise ValueError("empty or binary update")
+    compile(source, "LotsManager.update.py", "exec", dont_inherit=True)
+    tree = ast.parse(source, filename="LotsManager.update.py")
+    metadata = {}
+    hooks = set()
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        value_node = node.value
+        for target in targets:
+            if not isinstance(target, ast.Name):
+                continue
+            if target.id in {"NAME", "VERSION", "UUID"}:
+                if not isinstance(value_node, ast.Constant) or not isinstance(value_node.value, str):
+                    raise ValueError(f"dynamic metadata: {target.id}")
+                metadata[target.id] = value_node.value
+            if target.id in {"BIND_TO_PRE_INIT", "BIND_TO_DELETE"}:
+                hooks.add(target.id)
+    if metadata.get("NAME") != NAME or metadata.get("UUID") != UUID:
+        raise ValueError("update belongs to another plugin")
+    version_tuple(metadata.get("VERSION", ""))
+    if "BIND_TO_PRE_INIT" not in hooks or "BIND_TO_DELETE" not in hooks:
+        raise ValueError("missing plugin lifecycle metadata")
+    return metadata
+
+
+def build_update_urls(commit_sha: str) -> tuple[str, str]:
+    if not re.fullmatch(r"[0-9a-f]{40}", str(commit_sha or "")):
+        raise ValueError("invalid GitHub commit")
+    api_url = f"https://api.github.com/repos/{UPDATER_OWNER}/{UPDATER_REPO}/commits?path={UPDATER_SOURCE_PATH}&sha=main&per_page=1"
+    raw_url = f"https://raw.githubusercontent.com/{UPDATER_OWNER}/{UPDATER_REPO}/{commit_sha}/{UPDATER_SOURCE_PATH}"
+    return api_url, raw_url
 
 
 def sanitize_lot_fields(fields: dict, *, include_delivery_secrets: bool = False) -> dict:
@@ -500,6 +570,221 @@ def init_commands(cardinal: Cardinal):
         return
     tg = cardinal.telegram
     bot = cardinal.telegram.bot
+
+    def load_updater_settings():
+        if not exists(UPDATER_SETTINGS_FILE):
+            return
+        try:
+            with open(UPDATER_SETTINGS_FILE, "r", encoding="utf-8") as file:
+                loaded = json.load(file)
+            if not isinstance(loaded, dict):
+                raise ValueError("updater settings must be an object")
+            if loaded.get("schema") != 1 or loaded.get("consent_fingerprint") != UPDATER_CONSENT_FINGERPRINT:
+                raise ValueError("updater consent source changed")
+            if loaded.get("consent") in {"unknown", "accepted", "declined"}:
+                updater_settings["consent"] = loaded["consent"]
+            if isinstance(loaded.get("enabled"), bool):
+                updater_settings["enabled"] = loaded["enabled"]
+            timestamp = loaded.get("last_checked_at", 0)
+            if isinstance(timestamp, int) and 0 <= timestamp <= int(time.time()) + 300:
+                updater_settings["last_checked_at"] = timestamp
+            commit = loaded.get("last_commit")
+            if commit is None or re.fullmatch(r"[0-9a-f]{40}", str(commit)):
+                updater_settings["last_commit"] = commit
+            remote_version = loaded.get("last_version")
+            if remote_version is None:
+                updater_settings["last_version"] = None
+            else:
+                version_tuple(remote_version)
+                updater_settings["last_version"] = remote_version
+            updater_settings["consent_fingerprint"] = UPDATER_CONSENT_FINGERPRINT
+            if updater_settings["consent"] != "accepted":
+                updater_settings["enabled"] = False
+        except (OSError, ValueError, json.JSONDecodeError):
+            logger.error("[LOTS UPDATER] Настройки повреждены; автообновления выключены.")
+            updater_settings.update({"consent": "unknown", "enabled": False})
+
+    def save_updater_settings():
+        atomic_write_json(UPDATER_SETTINGS_FILE, updater_settings)
+
+    def updater_consent_keyboard():
+        keyboard = telebot.types.InlineKeyboardMarkup(row_width=2)
+        keyboard.row(
+            telebot.types.InlineKeyboardButton("✅ Включить", callback_data=f"{UPDATER_CB_CONSENT}:yes"),
+            telebot.types.InlineKeyboardButton("🚫 Не включать", callback_data=f"{UPDATER_CB_CONSENT}:no")
+        )
+        return keyboard
+
+    def ask_updater_consent(chat_id: int):
+        bot.send_message(
+            chat_id,
+            "🔄 <b>Автообновления LotsManager</b>\n\n"
+            "Разрешить плагину проверять публичный репозиторий GitHub и безопасно устанавливать новые версии?\n\n"
+            "Источник кода: <code>github.com/voterol/users-voterol-fpc</code>. "
+            "Включая обновления, вы доверяете владельцу этого репозитория новый код плагина.\n\n"
+            "• обновляется только файл LotsManager.py;\n"
+            "• проверяются HTTPS-адрес, commit SHA, NAME, UUID и синтаксис;\n"
+            "• перед заменой создаётся резервная копия;\n"
+            "• новая версия запускается только после перезапуска Cardinal;\n"
+            "• настройку можно отключить в любое время командой /lots_update.",
+            parse_mode="HTML", reply_markup=updater_consent_keyboard()
+        )
+
+    def resolve_plugin_path() -> Path:
+        plugin_data = cardinal.plugins.get(UUID)
+        if plugin_data is None or not getattr(plugin_data, "path", None):
+            raise RuntimeError("Cardinal не сообщил путь плагина")
+        configured = Path(plugin_data.path)
+        if configured.is_symlink():
+            raise RuntimeError("файл плагина является символической ссылкой")
+        target = configured.resolve()
+        plugins_dir = Path("plugins").resolve()
+        if target.parent != plugins_dir or target.suffix != ".py" or not target.is_file():
+            raise RuntimeError("небезопасный путь файла плагина")
+        return target
+
+    def fetch_limited_json(url: str):
+        request = Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "LotsManager-Updater"})
+        with urlopen(request, timeout=15) as response:
+            if response.geturl() != url:
+                raise RuntimeError("GitHub API перенаправил запрос")
+            payload = response.read(256 * 1024 + 1)
+        if len(payload) > 256 * 1024:
+            raise RuntimeError("ответ GitHub API слишком большой")
+        return json.loads(payload.decode("utf-8"))
+
+    def fetch_limited_source(url: str) -> str:
+        request = Request(url, headers={"Accept": "text/plain", "User-Agent": "LotsManager-Updater"})
+        with urlopen(request, timeout=20) as response:
+            if response.geturl() != url:
+                raise RuntimeError("GitHub Raw перенаправил запрос")
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > UPDATER_MAX_BYTES:
+                raise RuntimeError("файл обновления слишком большой")
+            payload = response.read(UPDATER_MAX_BYTES + 1)
+        if len(payload) > UPDATER_MAX_BYTES:
+            raise RuntimeError("файл обновления слишком большой")
+        return payload.decode("utf-8")
+
+    def check_and_install_update() -> dict:
+        if not updater_lock.acquire(blocking=False):
+            return {"status": "busy"}
+        try:
+            api_url, _ = build_update_urls("0" * 40)
+            commits = fetch_limited_json(api_url)
+            if not isinstance(commits, list) or not commits:
+                raise RuntimeError("GitHub не вернул историю файла")
+            if not isinstance(commits[0], dict):
+                raise RuntimeError("GitHub вернул некорректный commit")
+            commit_sha = str(commits[0].get("sha") or "")
+            _, raw_url = build_update_urls(commit_sha)
+            source = fetch_limited_source(raw_url)
+            metadata = validate_update_source(source)
+            if (updater_settings.get("last_commit") == commit_sha and
+                    updater_settings.get("last_version") == metadata["VERSION"]):
+                return {"status": "current", "version": metadata["VERSION"]}
+            if version_tuple(metadata["VERSION"]) <= version_tuple(VERSION):
+                updater_settings.update({
+                    "last_checked_at": int(time.time()), "last_commit": commit_sha,
+                    "last_version": metadata["VERSION"],
+                })
+                save_updater_settings()
+                return {"status": "current", "version": metadata["VERSION"]}
+
+            target = resolve_plugin_path()
+            current_bytes = target.read_bytes()
+            current_source = current_bytes.decode("utf-8")
+            validate_update_source(current_source)
+            backup = target.with_name(f"{target.name}.backup-{VERSION}-{token_hex(6)}")
+            temp_path = None
+            try:
+                shutil.copy2(target, backup)
+                if hashlib.sha256(backup.read_bytes()).hexdigest() != hashlib.sha256(current_bytes).hexdigest():
+                    raise RuntimeError("резервная копия повреждена")
+                source_bytes = source.encode("utf-8")
+                with NamedTemporaryFile("wb", dir=target.parent, prefix=f".{target.name}.",
+                                       suffix=".update", delete=False) as temp:
+                    temp.write(source_bytes)
+                    temp.flush()
+                    import os
+                    os.fsync(temp.fileno())
+                    temp_path = Path(temp.name)
+                if hashlib.sha256(temp_path.read_bytes()).hexdigest() != hashlib.sha256(source_bytes).hexdigest():
+                    raise RuntimeError("контрольная сумма временного файла не совпала")
+                replace(str(temp_path), str(target))
+                temp_path = None
+                validate_update_source(target.read_text(encoding="utf-8"))
+            except Exception:
+                if backup.exists():
+                    rollback_temp = None
+                    try:
+                        with NamedTemporaryFile("wb", dir=target.parent, prefix=f".{target.name}.",
+                                               suffix=".rollback", delete=False) as rollback:
+                            rollback.write(backup.read_bytes())
+                            rollback.flush()
+                            import os
+                            os.fsync(rollback.fileno())
+                            rollback_temp = Path(rollback.name)
+                        replace(str(rollback_temp), str(target))
+                        rollback_temp = None
+                    finally:
+                        if rollback_temp and rollback_temp.exists():
+                            rollback_temp.unlink()
+                raise
+            finally:
+                if temp_path and temp_path.exists():
+                    temp_path.unlink()
+            updater_settings.update({
+                "last_checked_at": int(time.time()), "last_commit": commit_sha,
+                "last_version": metadata["VERSION"],
+            })
+            save_updater_settings()
+            return {"status": "installed", "version": metadata["VERSION"], "backup": str(backup)}
+        finally:
+            updater_lock.release()
+
+    def updater_result_text(result: dict) -> str:
+        status = result.get("status")
+        if status == "installed":
+            return f"✅ Установлена версия <b>{html_text(result['version'])}</b>. Перезапустите Cardinal командой /restart."
+        if status == "current":
+            return f"✅ Установлена актуальная версия <b>{html_text(VERSION)}</b>."
+        if status == "busy":
+            return "⏳ Проверка обновлений уже выполняется."
+        return "❌ Неизвестный результат проверки."
+
+    def maybe_auto_update(chat_id: int):
+        if updater_settings.get("consent") != "accepted" or not updater_settings.get("enabled"):
+            return
+        if time.time() - float(updater_settings.get("last_checked_at") or 0) < UPDATER_CHECK_INTERVAL:
+            return
+        def worker():
+            try:
+                result = check_and_install_update()
+                if result.get("status") == "installed":
+                    bot.send_message(chat_id, updater_result_text(result), parse_mode="HTML")
+            except Exception as exc:
+                logger.error("[LOTS UPDATER] Автопроверка не удалась: %s", exc, exc_info=True)
+        threading.Thread(target=worker, name="LotsManagerUpdater", daemon=True).start()
+
+    def gate_first_use(message) -> bool:
+        if updater_settings.get("consent") == "unknown":
+            ask_updater_consent(message.chat.id)
+            return False
+        maybe_auto_update(message.chat.id)
+        return True
+
+    load_updater_settings()
+
+    def is_unconsented_plugin_callback(call) -> bool:
+        data = str(getattr(call, "data", "") or "")
+        is_plugin_callback = data.startswith(("ml_", "mm_", "lots_copy_plugin."))
+        return updater_settings.get("consent") == "unknown" and is_plugin_callback
+
+    @bot.callback_query_handler(func=is_unconsented_plugin_callback)
+    def callback_first_use_consent(call):
+        bot.answer_callback_query(call.id, "Сначала выберите настройку обновлений")
+        ask_updater_consent(call.message.chat.id)
 
     def format_seconds(seconds: float) -> str:
         seconds = max(int(seconds), 0)
@@ -1541,7 +1826,9 @@ def init_commands(cardinal: Cardinal):
                 "⚙️ <b>Раздел: Настройки</b>\n\n"
                 "• подкатегории поиска лотов\n"
                 "• теги лотов\n"
-                f"• автовыдача при копировании: {'🟢 включена' if secrets_enabled else '🔴 выключена'}"
+                f"• автовыдача при копировании: {'🟢 включена' if secrets_enabled else '🔴 выключена'}\n"
+                f"• автообновления: {'🟢 включены' if updater_settings.get('enabled') else '🔴 выключены'}\n"
+                f"• версия LotsManager: <b>{html_text(VERSION)}</b>"
             ),
             "history": (
                 "🕘 <b>Раздел: История</b>\n\n"
@@ -1592,6 +1879,13 @@ def init_commands(cardinal: Cardinal):
                     callback_data=f"{CB_MENU_ACTION}:copy_with_secrets"
                 ),
                 telebot.types.InlineKeyboardButton("❓ Справка по тегам", callback_data=f"{CB_MENU_ACTION}:tags_help")
+            )
+            keyboard.row(
+                telebot.types.InlineKeyboardButton(
+                    f"🔄 Автообновления: {'🟢 Вкл' if updater_settings.get('enabled') else '🔴 Выкл'}",
+                    callback_data=UPDATER_CB_TOGGLE
+                ),
+                telebot.types.InlineKeyboardButton("⬇️ Проверить сейчас", callback_data=UPDATER_CB_CHECK)
             )
         elif section == "history":
             keyboard.row(
@@ -4696,6 +4990,80 @@ def init_commands(cardinal: Cardinal):
             logger.exception("TRACEBACK:")
             bot.send_message(m.chat.id, f"❌ Произошла ошибка: {str(e)}")
 
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{UPDATER_CB_CONSENT}:"))
+    def callback_updater_consent(call):
+        answer = call.data.rsplit(":", 1)[1]
+        updater_settings["consent"] = "accepted" if answer == "yes" else "declined"
+        updater_settings["enabled"] = answer == "yes"
+        updater_settings["consent_fingerprint"] = UPDATER_CONSENT_FINGERPRINT
+        save_updater_settings()
+        bot.answer_callback_query(call.id, "Настройка сохранена")
+        bot.edit_message_text(
+            "✅ Автообновления включены. Повторите нужную команду."
+            if answer == "yes" else
+            "🚫 Автообновления выключены. Повторите нужную команду; плагин продолжит работать без сетевых проверок.",
+            call.message.chat.id, call.message.message_id
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data == UPDATER_CB_TOGGLE)
+    def callback_updater_toggle(call):
+        enabled = not updater_settings.get("enabled", False)
+        updater_settings["consent"] = "accepted" if enabled else "declined"
+        updater_settings["enabled"] = enabled
+        updater_settings["consent_fingerprint"] = UPDATER_CONSENT_FINGERPRINT
+        save_updater_settings()
+        bot.answer_callback_query(call.id, "✅ Автообновления включены" if enabled else "🚫 Автообновления выключены")
+        bot.edit_message_text(
+            render_manage_menu_text("settings"), call.message.chat.id, call.message.message_id,
+            parse_mode="HTML", reply_markup=create_manage_menu_keyboard("settings")
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data == UPDATER_CB_CHECK)
+    def callback_updater_check(call):
+        if updater_settings.get("consent") != "accepted":
+            bot.answer_callback_query(call.id, "Сначала включите автообновления")
+            return
+        bot.answer_callback_query(call.id, "⏳ Проверяю GitHub...")
+        status = bot.send_message(call.message.chat.id, "⏳ Проверяю обновления LotsManager...")
+        def worker():
+            try:
+                result = check_and_install_update()
+                text = updater_result_text(result)
+            except Exception as exc:
+                logger.error("[LOTS UPDATER] Ручная проверка не удалась: %s", exc, exc_info=True)
+                text = "❌ Обновление не установлено. Проверьте подключение и логи Cardinal."
+            try:
+                bot.edit_message_text(text, call.message.chat.id, status.id, parse_mode="HTML")
+            except Exception:
+                logger.debug("[LOTS UPDATER] Не удалось обновить статусное сообщение.", exc_info=True)
+        threading.Thread(target=worker, name="LotsManagerManualUpdater", daemon=True).start()
+
+    def lots_update_command(m: Message):
+        if updater_settings.get("consent") == "unknown":
+            ask_updater_consent(m.chat.id)
+            return
+        keyboard = telebot.types.InlineKeyboardMarkup(row_width=2)
+        keyboard.row(
+            telebot.types.InlineKeyboardButton(
+                "🚫 Выключить" if updater_settings.get("enabled") else "✅ Включить",
+                callback_data=UPDATER_CB_TOGGLE
+            ),
+            telebot.types.InlineKeyboardButton("⬇️ Проверить сейчас", callback_data=UPDATER_CB_CHECK)
+        )
+        bot.send_message(
+            m.chat.id,
+            f"🔄 <b>Обновления LotsManager</b>\n\nВерсия: <b>{html_text(VERSION)}</b>\n"
+            f"Статус: {'🟢 включены' if updater_settings.get('enabled') else '🔴 выключены'}",
+            parse_mode="HTML", reply_markup=keyboard
+        )
+
+    def gate_handler(handler):
+        def wrapped(message, *args, **kwargs):
+            if not gate_first_use(message):
+                return None
+            return handler(message, *args, **kwargs)
+        return wrapped
+
     # ========== СТАРЫЕ ДВУХШАГОВЫЕ ОБРАБОТЧИКИ ОТКЛЮЧЕНЫ ==========
 
     # ========== РЕГИСТРАЦИЯ КОМАНД ==========
@@ -4714,24 +5082,26 @@ def init_commands(cardinal: Cardinal):
         ("clear_disabled_history", "очистить историю отключенных лотов", True),
         ("lots_tags", "создать/обновить теги для всех лотов", True),
         ("tags_help", "справка по использованию тегов", True),
-        ("edit_lot_tag", "изменить тег конкретного лота", True)
+        ("edit_lot_tag", "изменить тег конкретного лота", True),
+        ("lots_update", "настройки и проверка обновлений LotsManager", True)
     ])
 
-    tg.msg_handler(act_copy_lots, commands=["copy_lots"])
+    tg.msg_handler(gate_handler(act_copy_lots), commands=["copy_lots"])
     tg.msg_handler(copy_lots, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_COPY_LOTS))
-    tg.msg_handler(act_cache_lots, commands=["cache_lots"])
-    tg.msg_handler(act_create_lots, commands=["create_lots"])
-    tg.msg_handler(copy_with_secrets, commands=["copy_with_secrets"])
-    tg.msg_handler(manage_menu, commands=["manage_menu"])
-    tg.msg_handler(manage_lots, commands=["manage_lots"])
-    tg.msg_handler(show_lot_subcats, commands=["lot_subcats"])
-    tg.msg_handler(add_lot_subcat, commands=["add_lot_subcat"])
-    tg.msg_handler(remove_lot_subcat, commands=["remove_lot_subcat"])
-    tg.msg_handler(view_disabled_lots, commands=["disabled_lots"])
-    tg.msg_handler(clear_disabled_lots_history, commands=["clear_disabled_history"])
-    tg.msg_handler(manage_lot_tags, commands=["lots_tags"])
-    tg.msg_handler(show_lot_tags_help, commands=["tags_help"])
-    tg.msg_handler(edit_lot_tag, commands=["edit_lot_tag"])
+    tg.msg_handler(gate_handler(act_cache_lots), commands=["cache_lots"])
+    tg.msg_handler(gate_handler(act_create_lots), commands=["create_lots"])
+    tg.msg_handler(gate_handler(copy_with_secrets), commands=["copy_with_secrets"])
+    tg.msg_handler(gate_handler(manage_menu), commands=["manage_menu"])
+    tg.msg_handler(gate_handler(manage_lots), commands=["manage_lots"])
+    tg.msg_handler(gate_handler(show_lot_subcats), commands=["lot_subcats"])
+    tg.msg_handler(gate_handler(add_lot_subcat), commands=["add_lot_subcat"])
+    tg.msg_handler(gate_handler(remove_lot_subcat), commands=["remove_lot_subcat"])
+    tg.msg_handler(gate_handler(view_disabled_lots), commands=["disabled_lots"])
+    tg.msg_handler(gate_handler(clear_disabled_lots_history), commands=["clear_disabled_history"])
+    tg.msg_handler(gate_handler(manage_lot_tags), commands=["lots_tags"])
+    tg.msg_handler(gate_handler(show_lot_tags_help), commands=["tags_help"])
+    tg.msg_handler(gate_handler(edit_lot_tag), commands=["edit_lot_tag"])
+    tg.msg_handler(lots_update_command, commands=["lots_update"])
     tg.msg_handler(handle_filter_value, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_FILTER_VALUE))
     tg.msg_handler(handle_create_value, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_CREATE_VALUE))
     tg.msg_handler(handle_edit_price, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_EDIT_LOT_PRICE))
