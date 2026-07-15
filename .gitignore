@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.env
+.env.*
+*.log
+
+# Cardinal runtime data may contain account or delivery secrets.
+storage/cache/
+storage/plugins/copy_lots_settings.json
+storage/plugins/disabled_lots.json
+storage/plugins/lot_tags.json
