@@ -46,11 +46,11 @@ RUNNING = False
 LOTS_CACHE_TTL = 30
 UPDATER_SETTINGS_FILE = "storage/plugins/lots_manager_updater.json"
 UPDATER_OWNER = "voterol"
-UPDATER_REPO = "users-voterol-fpc"
+UPDATER_REPO = "FpcLotsManager"
 UPDATER_SOURCE_PATH = "LotsManager.py"
 UPDATER_CHECK_INTERVAL = 6 * 60 * 60
 UPDATER_MAX_BYTES = 2 * 1024 * 1024
-UPDATER_CONSENT_FINGERPRINT = "v1:github:voterol/users-voterol-fpc:main:LotsManager.py:auto-install"
+UPDATER_CONSENT_FINGERPRINT = "v1:github:voterol/FpcLotsManager:main:LotsManager.py:auto-install"
 UPDATER_CB_CONSENT = "lm_upd_consent"
 UPDATER_CB_TOGGLE = "lm_upd_toggle"
 UPDATER_CB_CHECK = "lm_upd_check"
@@ -620,7 +620,7 @@ def init_commands(cardinal: Cardinal):
             chat_id,
             "🔄 <b>Автообновления LotsManager</b>\n\n"
             "Разрешить плагину проверять публичный репозиторий GitHub и безопасно устанавливать новые версии?\n\n"
-            "Источник кода: <code>github.com/voterol/users-voterol-fpc</code>. "
+            "Источник кода: <code>github.com/voterol/FpcLotsManager</code>. "
             "Включая обновления, вы доверяете владельцу этого репозитория новый код плагина.\n\n"
             "• обновляется только файл LotsManager.py;\n"
             "• проверяются HTTPS-адрес, commit SHA, NAME, UUID и синтаксис;\n"
