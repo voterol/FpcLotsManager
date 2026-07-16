@@ -20,6 +20,7 @@ HELPERS = {
     "lot_title",
     "lot_price_number",
     "apply_lot_filters",
+    "build_lot_link_messages",
     "parse_lot_select_fields",
     "discover_lot_create_url",
     "parse_lot_form_defaults",
@@ -134,6 +135,32 @@ class HelperTests(unittest.TestCase):
         self.assertEqual([lot.id for lot in apply(lots, {**defaults, "title_query": "product"})], [2])
         self.assertEqual([lot.id for lot in apply(lots, {**defaults, "title_query": "alpha", "status": "active"})], [])
         self.assertEqual([lot.id for lot in apply(lots, {**defaults, "title_query": "   "})], [1, 2, 3])
+
+    def test_lot_link_messages_include_every_link_and_escape_titles(self):
+        class Lot:
+            def __init__(self, lot_id, title):
+                self.id = lot_id
+                self.description = title
+
+        lots = [Lot(1, "Телефон <тест>"), Lot(2, "Alpha & Beta"), Lot(3, "Другой лот")]
+        messages = self.helpers["build_lot_link_messages"](lots, max_length=256)
+        combined = "\n".join(messages)
+        self.assertTrue(messages)
+        self.assertTrue(all(len(message) <= 256 for message in messages))
+        self.assertIn("Телефон &lt;тест&gt;", combined)
+        self.assertIn("Alpha &amp; Beta", combined)
+        for lot in lots:
+            self.assertEqual(combined.count(f"https://funpay.com/lots/offer?id={lot.id}"), 1)
+
+    def test_lot_link_messages_respect_telegram_utf16_limit(self):
+        class Lot:
+            def __init__(self, lot_id):
+                self.id = lot_id
+                self.description = "😀" * 100
+
+        messages = self.helpers["build_lot_link_messages"]([Lot(i) for i in range(1, 30)])
+        self.assertGreater(len(messages), 1)
+        self.assertTrue(all(len(message.encode("utf-16-le")) // 2 <= 3900 for message in messages))
 
     def test_parse_lot_select_fields_extracts_visible_allowed_options(self):
         if BeautifulSoup is None:
@@ -268,12 +295,12 @@ BIND_TO_DELETE = None
         with self.assertRaises(SyntaxError):
             validate(source + "if")
         current_source = PLUGIN_PATH.read_text(encoding="utf-8")
-        self.assertEqual(validate(current_source)["VERSION"], "1.2.0")
+        self.assertEqual(validate(current_source)["VERSION"], "1.3.0")
 
     def test_root_version_matches_plugin_metadata(self):
         root_version = (PLUGIN_PATH.parent / "VERSION").read_text(encoding="utf-8")
-        self.assertEqual(self.helpers["parse_version_document"](root_version), "1.2.0")
-        self.assertEqual(self.helpers["validate_update_source"](PLUGIN_PATH.read_text(encoding="utf-8"))["VERSION"], "1.2.0")
+        self.assertEqual(self.helpers["parse_version_document"](root_version), "1.3.0")
+        self.assertEqual(self.helpers["validate_update_source"](PLUGIN_PATH.read_text(encoding="utf-8"))["VERSION"], "1.3.0")
 
     def test_version_document_and_update_direction(self):
         parse = self.helpers["parse_version_document"]

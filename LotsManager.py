@@ -35,7 +35,7 @@ import json
 
 
 NAME = "LotsManager"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DESCRIPTION = "Плагин для копирования и управления лотами через inline кнопки."
 CREDITS = "@woopertail, @sidor0912, @voterol (gpt5.6-sol)"
 UUID = "5693f220-bcc6-4f6e-9745-9dee8664cbb2"
@@ -564,6 +564,30 @@ def apply_lot_filters(lots, filters: dict):
     elif sort_mode == "length_desc":
         result.sort(key=lambda lot: (-len(lot_title(lot)), lot_title(lot).casefold(), lot.id))
     return result
+
+
+def build_lot_link_messages(lots, max_length: int = 3900) -> list[str]:
+    """Render complete lot links in Telegram-safe HTML message chunks."""
+    max_length = max(256, min(int(max_length), 4096))
+    telegram_length = lambda value: len(value.encode("utf-16-le")) // 2
+    header = "🔗 <b>Ссылки на найденные лоты</b>"
+    messages = []
+    current = header
+    for lot in lots:
+        entry = (
+            f"• {html_text(lot_title(lot))}\n"
+            f"https://funpay.com/lots/offer?id={int(lot.id)}"
+        )
+        candidate = f"{current}\n\n{entry}"
+        if telegram_length(candidate) <= max_length:
+            current = candidate
+            continue
+        if current != header:
+            messages.append(current)
+        current = entry
+    if current != header:
+        messages.append(current)
+    return messages
 
 
 def atomic_write_json(file_path: str | Path, payload) -> None:
@@ -2866,6 +2890,70 @@ def init_commands(cardinal: Cardinal):
             bot.send_message(m.chat.id, f"❌ Произошла ошибка при получении списка лотов.\n\n"
                                         f"Ошибка: {str(e)}\n\n"
                                         f"Проверьте логи Cardinal для подробностей.")
+
+    def lmsearch(m: telebot.types.Message):
+        """Find lots by a title fragment and open the regular management menu."""
+        query = str(getattr(m, "text", "") or "").partition(" ")[2].strip()
+        if not query:
+            bot.send_message(m.chat.id, "❌ Укажи название или слово. Пример: <code>/lmsearch телефон</code>", parse_mode="HTML")
+            return
+        if len(query) > LIMITS["title_max"]:
+            bot.send_message(m.chat.id, f"❌ Поисковый запрос не должен превышать {LIMITS['title_max']} символов.")
+            return
+        if is_user_busy(m.from_user.id):
+            bot.send_message(m.chat.id, "❌ Операция уже выполняется. Подождите.")
+            return
+
+        progress = None
+        set_user_busy(m.from_user.id)
+        try:
+            logger.info("[LOTS SEARCH] Пользователь %s ищет лоты: %r", m.from_user.id, query)
+            progress = create_progress_tracker(m.chat.id, "Поиск лотов", status="Получаю категории и лоты")
+            all_lots = get_all_lots(m.chat.id, progress_tracker=progress, progress_status="Получаю категории и лоты")
+            filters = dict(DEFAULT_LOT_FILTERS)
+            filters["title_query"] = query
+            matches = apply_lot_filters(all_lots, filters)
+
+            state = get_user_state(m.from_user.id)
+            state["all_lots"] = list(all_lots)
+            state["lot_filters"] = filters
+            state["lots"] = matches
+            state["page"] = 0
+            clear_selected_lots(m.from_user.id)
+
+            if not matches:
+                finish_progress_tracker(progress, f"📭 По запросу «{query}» ничего не найдено.")
+                bot.send_message(
+                    m.chat.id,
+                    f"📭 По запросу <b>{html_text(query)}</b> похожих лотов не найдено.",
+                    parse_mode="HTML"
+                )
+                return
+
+            bot.send_message(
+                m.chat.id,
+                render_manage_lots_text(
+                    matches,
+                    prefix_text=f"🔎 Найдено по запросу <b>{html_text(query)}</b>: <b>{len(matches)}</b>",
+                    state=state
+                ),
+                reply_markup=create_lots_keyboard(matches, 0, selection_mode=False, selected_ids=[]),
+                parse_mode="HTML"
+            )
+            for links_message in build_lot_link_messages(matches):
+                bot.send_message(m.chat.id, links_message, parse_mode="HTML", disable_web_page_preview=True)
+            finish_progress_tracker(progress, f"✅ Найдено лотов: {len(matches)}")
+        except Exception as error:
+            if progress is not None:
+                try:
+                    finish_progress_tracker(progress, "❌ Не удалось выполнить поиск лотов.")
+                except Exception:
+                    pass
+            logger.error("[LOTS SEARCH] Ошибка поиска для пользователя %s: %s", m.from_user.id, error)
+            logger.debug("TRACEBACK", exc_info=True)
+            bot.send_message(m.chat.id, "❌ Не удалось выполнить поиск лотов. Проверьте логи Cardinal.")
+        finally:
+            clear_user_busy(m.from_user.id)
 
     def manage_menu(m: telebot.types.Message):
         bot.send_message(
@@ -5329,6 +5417,7 @@ def init_commands(cardinal: Cardinal):
         ("copy_with_secrets", "Копировать ли встроенную автовыдачу FunPay?", True),
         ("manage_menu", "главное меню управления плагином", True),
         ("manage_lots", "управление лотами (inline меню)", True),
+        ("lmsearch", "поиск лотов по названию или слову", True),
         ("lot_subcats", "показать подкатегории для поиска лотов", True),
         ("add_lot_subcat", "добавить ID подкатегорий для поиска", True),
         ("remove_lot_subcat", "удалить ID подкатегорий из поиска", True),
@@ -5347,6 +5436,7 @@ def init_commands(cardinal: Cardinal):
     tg.msg_handler(gate_handler(copy_with_secrets), commands=["copy_with_secrets"])
     tg.msg_handler(gate_handler(manage_menu), commands=["manage_menu"])
     tg.msg_handler(gate_handler(manage_lots), commands=["manage_lots"])
+    tg.msg_handler(gate_handler(lmsearch), commands=["lmsearch"])
     tg.msg_handler(gate_handler(show_lot_subcats), commands=["lot_subcats"])
     tg.msg_handler(gate_handler(add_lot_subcat), commands=["add_lot_subcat"])
     tg.msg_handler(gate_handler(remove_lot_subcat), commands=["remove_lot_subcat"])

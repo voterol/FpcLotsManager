@@ -39,6 +39,7 @@ Runtime-данные создаются в `storage/plugins/` и `storage/cache/
 
 - `/manage_menu` — главное меню;
 - `/manage_lots` — управление лотами;
+- `/lmsearch название или слово` — найти похожие лоты, открыть меню результатов и получить ссылки;
 - `/cache_lots` — экспорт в JSON;
 - `/create_lots` — импорт из JSON;
 - `/copy_lots` — копирование на другой аккаунт;
