@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 from html import escape
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from math import isfinite
 from os import replace
 from os.path import exists
 from pathlib import Path
+from secrets import token_hex
 from tempfile import NamedTemporaryFile
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
+import ast
+import hashlib
+import re
+import shutil
 
 import telebot
 import threading
+from bs4 import BeautifulSoup
 
 if TYPE_CHECKING:
     from cardinal import Cardinal
@@ -25,7 +34,7 @@ import json
 
 
 NAME = "LotsManager"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DESCRIPTION = "Плагин для копирования и управления лотами через inline кнопки."
 CREDITS = "@woopertail, @sidor0912, @voterol (gpt5.6-sol)"
 UUID = "5693f220-bcc6-4f6e-9745-9dee8664cbb2"
@@ -35,6 +44,16 @@ SETTINGS_PAGE = False
 logger = getLogger("FPC.lots_copy_plugin")
 RUNNING = False
 LOTS_CACHE_TTL = 30
+UPDATER_SETTINGS_FILE = "storage/plugins/lots_manager_updater.json"
+UPDATER_OWNER = "voterol"
+UPDATER_REPO = "users-voterol-fpc"
+UPDATER_SOURCE_PATH = "LotsManager.py"
+UPDATER_CHECK_INTERVAL = 6 * 60 * 60
+UPDATER_MAX_BYTES = 2 * 1024 * 1024
+UPDATER_CONSENT_FINGERPRINT = "v1:github:voterol/users-voterol-fpc:main:LotsManager.py:auto-install"
+UPDATER_CB_CONSENT = "lm_upd_consent"
+UPDATER_CB_TOGGLE = "lm_upd_toggle"
+UPDATER_CB_CHECK = "lm_upd_check"
 
 
 # Callback'и для копирования
@@ -46,6 +65,8 @@ CB_LOT_VIEW = "ml_view"
 CB_LOT_EDIT_PRICE = "ml_edit_price"
 CB_LOT_EDIT_TITLE = "ml_edit_title"
 CB_LOT_EDIT_DESC = "ml_edit_desc"
+CB_LOT_EDIT_DESC_RU = "ml_edit_desc_ru"
+CB_LOT_EDIT_DESC_EN = "ml_edit_desc_en"
 CB_LOT_TOGGLE = "ml_toggle"
 CB_LOT_DELETE = "ml_delete"
 CB_LOT_DELETE_CONFIRM = "ml_delete_confirm"
@@ -69,6 +90,7 @@ CB_SELECTED_DELETE_STEP = "ml_selected_del_step"
 CB_SELECT_CANCEL = "ml_select_cancel"
 CB_SUBCAT_MENU = "ml_subcat_menu"
 CB_SUBCAT_ADD = "ml_subcat_add"
+CB_SUBCAT_PICK = "ml_subcat_pick"
 CB_SUBCAT_REMOVE = "ml_subcat_remove"
 CB_SUBCAT_CLEAR_STEP = "ml_subcat_clear_step"
 CB_SUBCAT_DISCOVERED_TOGGLE = "ml_subcat_discovered_toggle"
@@ -82,6 +104,21 @@ CB_MENU_HISTORY = "mm_history"
 CB_MENU_ACTION = "mm_action"
 CB_MENU_HISTORY_CLEAR = "mm_history_clear"
 CB_CACHE_MODE = "ml_cache_mode"
+CB_FILTER_MENU = "ml_filter"
+CB_FILTER_STATUS = "ml_filter_status"
+CB_FILTER_PRICE = "ml_filter_price"
+CB_FILTER_LENGTH = "ml_filter_length"
+CB_FILTER_SORT = "ml_filter_sort"
+CB_FILTER_RESET = "ml_filter_reset"
+CB_FILTER_TITLE = "ml_filter_title"
+CB_FILTER_TITLE_CLEAR = "ml_filter_title_clear"
+CB_LOT_FIELDS = "ml_fields"
+CB_LOT_FIELD = "ml_field"
+CB_LOT_FIELD_VALUE = "ml_field_value"
+CB_CREATE_NEW = "ml_create_new"
+CB_CREATE_CATEGORY = "ml_create_category"
+CB_CREATE_OPTION = "ml_create_option"
+CB_CREATE_CANCEL = "ml_create_cancel"
 
 CBT_EDIT_LOT_PRICE = "manage_lots.edit_price"
 CBT_EDIT_LOT_TITLE_RU = "manage_lots.edit_title_ru"
@@ -91,6 +128,8 @@ CBT_EDIT_LOT_TITLE_RU_AFTER_EN = "manage_lots.edit_title_ru_after_en"
 CBT_EDIT_LOT_DESC = "manage_lots.edit_desc"
 CBT_EDIT_LOT_DESC_EN = "manage_lots.edit_desc_en"
 CBT_ADD_SUBCATEGORY_ID = "manage_lots.add_subcategory_id"
+CBT_FILTER_VALUE = "manage_lots.filter_value"
+CBT_CREATE_VALUE = "manage_lots.create_value"
 
 # Файл для хранения отключенных лотов
 DISABLED_LOTS_FILE = "storage/plugins/disabled_lots.json"
@@ -120,11 +159,65 @@ lots_cache = {
     "items": None,
     "expires_at": 0.0
 }
+updater_lock = threading.Lock()
+updater_settings = {
+    "schema": 1,
+    "consent": "unknown",
+    "enabled": False,
+    "last_checked_at": 0,
+    "last_commit": None,
+    "last_version": None,
+    "consent_fingerprint": None,
+}
 
 
 def html_text(value: object) -> str:
     """Escape untrusted text before embedding it in Telegram HTML."""
     return escape(str(value), quote=True)
+
+
+def version_tuple(value: str) -> tuple[int, ...]:
+    if not re.fullmatch(r"\d+\.\d+\.\d+", str(value or "")):
+        raise ValueError("invalid version")
+    return tuple(int(part) for part in str(value).split("."))
+
+
+def validate_update_source(source: str) -> dict:
+    """Validate plugin identity and syntax without executing downloaded code."""
+    if not isinstance(source, str) or not source or "\x00" in source:
+        raise ValueError("empty or binary update")
+    compile(source, "LotsManager.update.py", "exec", dont_inherit=True)
+    tree = ast.parse(source, filename="LotsManager.update.py")
+    metadata = {}
+    hooks = set()
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        value_node = node.value
+        for target in targets:
+            if not isinstance(target, ast.Name):
+                continue
+            if target.id in {"NAME", "VERSION", "UUID"}:
+                if not isinstance(value_node, ast.Constant) or not isinstance(value_node.value, str):
+                    raise ValueError(f"dynamic metadata: {target.id}")
+                metadata[target.id] = value_node.value
+            if target.id in {"BIND_TO_PRE_INIT", "BIND_TO_DELETE"}:
+                hooks.add(target.id)
+    if metadata.get("NAME") != NAME or metadata.get("UUID") != UUID:
+        raise ValueError("update belongs to another plugin")
+    version_tuple(metadata.get("VERSION", ""))
+    if "BIND_TO_PRE_INIT" not in hooks or "BIND_TO_DELETE" not in hooks:
+        raise ValueError("missing plugin lifecycle metadata")
+    return metadata
+
+
+def build_update_urls(commit_sha: str) -> tuple[str, str]:
+    if not re.fullmatch(r"[0-9a-f]{40}", str(commit_sha or "")):
+        raise ValueError("invalid GitHub commit")
+    api_url = f"https://api.github.com/repos/{UPDATER_OWNER}/{UPDATER_REPO}/commits?path={UPDATER_SOURCE_PATH}&sha=main&per_page=1"
+    raw_url = f"https://raw.githubusercontent.com/{UPDATER_OWNER}/{UPDATER_REPO}/{commit_sha}/{UPDATER_SOURCE_PATH}"
+    return api_url, raw_url
 
 
 def sanitize_lot_fields(fields: dict, *, include_delivery_secrets: bool = False) -> dict:
@@ -164,6 +257,207 @@ def validate_price_value(price_str: str):
     if price > LIMITS["price_max"]:
         return False, f"❌ Максимальная цена: {LIMITS['price_max']}", 0
     return True, "", price
+
+
+DEFAULT_LOT_FILTERS = {
+    "status": "all",
+    "title_query": None,
+    "price_min": None,
+    "price_max": None,
+    "title_len_min": None,
+    "title_len_max": None,
+    "sort": "default",
+}
+
+
+def lot_title(lot) -> str:
+    return str(getattr(lot, "description", None) or "Без названия")
+
+
+def lot_price_number(lot):
+    try:
+        value = float(str(getattr(lot, "price", "")).strip().replace(",", "."))
+        return value if isfinite(value) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_subcategory_ids_input(text: str):
+    payload = str(text or "").replace("\n", " ").replace(",", " ")
+    parts = [part.strip() for part in payload.split() if part.strip()]
+    parsed_ids = []
+    invalid_parts = []
+    for part in parts:
+        try:
+            value = int(part)
+            if value <= 0 or len(str(value)) > 12:
+                raise ValueError
+            parsed_ids.append(value)
+        except ValueError:
+            invalid_parts.append(part)
+    return parsed_ids, invalid_parts
+
+
+SYSTEM_LOT_FIELD_NAMES = {
+    "csrf_token", "offer_id", "node_id", "query", "deleted", "golden_key",
+    "price", "active", "amount", "secrets", "auto_delivery"
+}
+
+
+def parse_lot_select_fields(html_source: str) -> list[dict]:
+    """Extract editable visible selects and their allowed values from a FunPay lot form."""
+    soup = BeautifulSoup(html_source or "", "lxml")
+    form = soup.find("form", class_="form-offer-editor")
+    if form is None:
+        return []
+    result = []
+    for select in form.find_all("select"):
+        name = str(select.get("name") or "").strip()
+        group = select.find_parent(class_="form-group")
+        group_classes = set(group.get("class", [])) if group else set()
+        if not name or name in SYSTEM_LOT_FIELD_NAMES or "hidden" in group_classes or select.has_attr("disabled"):
+            continue
+        label_node = None
+        select_id = select.get("id")
+        if select_id:
+            label_node = form.find("label", attrs={"for": select_id})
+        if label_node is None and group is not None:
+            label_node = group.find("label") or group.find(class_="control-label")
+        label = " ".join(label_node.get_text(" ", strip=True).split()) if label_node else name
+        options = []
+        selected_value = str(select.get("value") or "")
+        for option in select.find_all("option"):
+            if option.has_attr("disabled"):
+                continue
+            value = str(option.get("value") or "")
+            option_label = " ".join(option.get_text(" ", strip=True).split())
+            options.append({"value": value, "label": option_label})
+            if option.has_attr("selected"):
+                selected_value = value
+        if not selected_value and options:
+            selected_value = options[0]["value"]
+        selected = next((item for item in options if item["value"] == selected_value), None)
+        if options:
+            result.append({
+                "name": name,
+                "label": label or name,
+                "value": selected_value,
+                "value_label": selected["label"] if selected else selected_value,
+                "options": options,
+            })
+    return result
+
+
+def discover_lot_create_url(html_source: str) -> str | None:
+    """Find an authenticated FunPay new-offer editor URL without trusting arbitrary hosts."""
+    soup = BeautifulSoup(html_source or "", "lxml")
+    candidates = []
+    for node in soup.find_all(True):
+        for attribute in ("href", "data-href", "data-url", "data-action"):
+            value = str(node.get(attribute) or "").strip()
+            if "offerEdit" in value and ("offer=0" in value or "offer=new" in value):
+                candidates.append(value)
+    for value in candidates:
+        parsed = urlparse(value)
+        if parsed.scheme and parsed.netloc != "funpay.com":
+            continue
+        return value
+    return None
+
+
+def parse_lot_form_defaults(html_source: str) -> dict:
+    """Extract the complete default payload of a FunPay offer editor form."""
+    soup = BeautifulSoup(html_source or "", "lxml")
+    form = soup.find("form", class_="form-offer-editor")
+    if form is None:
+        return {}
+    result = {}
+    for field in form.find_all("input"):
+        name = str(field.get("name") or "").strip()
+        if not name or name == "query" or field.has_attr("disabled"):
+            continue
+        field_type = str(field.get("type") or "text").lower()
+        if field_type in {"checkbox", "radio"} and not field.has_attr("checked"):
+            continue
+        result[name] = str(field.get("value") or ("on" if field_type in {"checkbox", "radio"} else ""))
+    for field in form.find_all("textarea"):
+        name = str(field.get("name") or "").strip()
+        if name and not field.has_attr("disabled"):
+            result[name] = field.get_text() or ""
+    for field in form.find_all("select"):
+        name = str(field.get("name") or "").strip()
+        if not name or field.has_attr("disabled"):
+            continue
+        selected = field.find("option", selected=True) or field.find("option")
+        if selected is not None:
+            result[name] = str(selected.get("value") or "")
+    return result
+
+
+def unsupported_required_lot_fields(html_source: str, supported_names: set[str]) -> list[str]:
+    """Return required empty controls the wizard cannot safely populate."""
+    soup = BeautifulSoup(html_source or "", "lxml")
+    form = soup.find("form", class_="form-offer-editor")
+    if form is None:
+        return ["form-offer-editor"]
+    unsupported = []
+    for control in form.find_all(["input", "textarea", "select"]):
+        name = str(control.get("name") or "").strip()
+        if not name or name in supported_names or not control.has_attr("required") or control.has_attr("disabled"):
+            continue
+        if control.name == "select":
+            selected = control.find("option", selected=True) or control.find("option")
+            value = str(selected.get("value") or "") if selected else ""
+        elif str(control.get("type") or "").lower() in {"checkbox", "radio"}:
+            value = str(control.get("value") or "on") if control.has_attr("checked") else ""
+        else:
+            value = str(control.get("value") or control.get_text() or "").strip()
+        if not value:
+            unsupported.append(name)
+    return unsupported
+
+
+def apply_lot_filters(lots, filters: dict):
+    """Return a filtered and sorted copy of a short FunPay lot list."""
+    result = []
+    status = filters.get("status", "all")
+    title_query = str(filters.get("title_query") or "").strip().casefold()
+    for lot in lots:
+        if status == "active" and not getattr(lot, "active", False):
+            continue
+        if status == "inactive" and getattr(lot, "active", False):
+            continue
+
+        if title_query and title_query not in lot_title(lot).casefold():
+            continue
+
+        title_length = len(lot_title(lot))
+        if filters.get("title_len_min") is not None and title_length < filters["title_len_min"]:
+            continue
+        if filters.get("title_len_max") is not None and title_length > filters["title_len_max"]:
+            continue
+
+        price = lot_price_number(lot)
+        if filters.get("price_min") is not None and (price is None or price < filters["price_min"]):
+            continue
+        if filters.get("price_max") is not None and (price is None or price > filters["price_max"]):
+            continue
+        result.append(lot)
+
+    sort_mode = filters.get("sort", "default")
+    if sort_mode == "price_asc":
+        result.sort(key=lambda lot: (lot_price_number(lot) is None, lot_price_number(lot) or 0, lot.id))
+    elif sort_mode == "price_desc":
+        result.sort(key=lambda lot: (lot_price_number(lot) is None, -(lot_price_number(lot) or 0), lot.id))
+    elif sort_mode == "alpha_asc":
+        result.sort(key=lambda lot: (lot_title(lot).casefold(), lot.id))
+    elif sort_mode == "alpha_desc":
+        result.sort(key=lambda lot: (lot_title(lot).casefold(), lot.id), reverse=True)
+    elif sort_mode == "length_asc":
+        result.sort(key=lambda lot: (len(lot_title(lot)), lot_title(lot).casefold(), lot.id))
+    elif sort_mode == "length_desc":
+        result.sort(key=lambda lot: (-len(lot_title(lot)), lot_title(lot).casefold(), lot.id))
+    return result
 
 
 def atomic_write_json(file_path: str | Path, payload) -> None:
@@ -276,6 +570,221 @@ def init_commands(cardinal: Cardinal):
         return
     tg = cardinal.telegram
     bot = cardinal.telegram.bot
+
+    def load_updater_settings():
+        if not exists(UPDATER_SETTINGS_FILE):
+            return
+        try:
+            with open(UPDATER_SETTINGS_FILE, "r", encoding="utf-8") as file:
+                loaded = json.load(file)
+            if not isinstance(loaded, dict):
+                raise ValueError("updater settings must be an object")
+            if loaded.get("schema") != 1 or loaded.get("consent_fingerprint") != UPDATER_CONSENT_FINGERPRINT:
+                raise ValueError("updater consent source changed")
+            if loaded.get("consent") in {"unknown", "accepted", "declined"}:
+                updater_settings["consent"] = loaded["consent"]
+            if isinstance(loaded.get("enabled"), bool):
+                updater_settings["enabled"] = loaded["enabled"]
+            timestamp = loaded.get("last_checked_at", 0)
+            if isinstance(timestamp, int) and 0 <= timestamp <= int(time.time()) + 300:
+                updater_settings["last_checked_at"] = timestamp
+            commit = loaded.get("last_commit")
+            if commit is None or re.fullmatch(r"[0-9a-f]{40}", str(commit)):
+                updater_settings["last_commit"] = commit
+            remote_version = loaded.get("last_version")
+            if remote_version is None:
+                updater_settings["last_version"] = None
+            else:
+                version_tuple(remote_version)
+                updater_settings["last_version"] = remote_version
+            updater_settings["consent_fingerprint"] = UPDATER_CONSENT_FINGERPRINT
+            if updater_settings["consent"] != "accepted":
+                updater_settings["enabled"] = False
+        except (OSError, ValueError, json.JSONDecodeError):
+            logger.error("[LOTS UPDATER] Настройки повреждены; автообновления выключены.")
+            updater_settings.update({"consent": "unknown", "enabled": False})
+
+    def save_updater_settings():
+        atomic_write_json(UPDATER_SETTINGS_FILE, updater_settings)
+
+    def updater_consent_keyboard():
+        keyboard = telebot.types.InlineKeyboardMarkup(row_width=2)
+        keyboard.row(
+            telebot.types.InlineKeyboardButton("✅ Включить", callback_data=f"{UPDATER_CB_CONSENT}:yes"),
+            telebot.types.InlineKeyboardButton("🚫 Не включать", callback_data=f"{UPDATER_CB_CONSENT}:no")
+        )
+        return keyboard
+
+    def ask_updater_consent(chat_id: int):
+        bot.send_message(
+            chat_id,
+            "🔄 <b>Автообновления LotsManager</b>\n\n"
+            "Разрешить плагину проверять публичный репозиторий GitHub и безопасно устанавливать новые версии?\n\n"
+            "Источник кода: <code>github.com/voterol/users-voterol-fpc</code>. "
+            "Включая обновления, вы доверяете владельцу этого репозитория новый код плагина.\n\n"
+            "• обновляется только файл LotsManager.py;\n"
+            "• проверяются HTTPS-адрес, commit SHA, NAME, UUID и синтаксис;\n"
+            "• перед заменой создаётся резервная копия;\n"
+            "• новая версия запускается только после перезапуска Cardinal;\n"
+            "• настройку можно отключить в любое время командой /lots_update.",
+            parse_mode="HTML", reply_markup=updater_consent_keyboard()
+        )
+
+    def resolve_plugin_path() -> Path:
+        plugin_data = cardinal.plugins.get(UUID)
+        if plugin_data is None or not getattr(plugin_data, "path", None):
+            raise RuntimeError("Cardinal не сообщил путь плагина")
+        configured = Path(plugin_data.path)
+        if configured.is_symlink():
+            raise RuntimeError("файл плагина является символической ссылкой")
+        target = configured.resolve()
+        plugins_dir = Path("plugins").resolve()
+        if target.parent != plugins_dir or target.suffix != ".py" or not target.is_file():
+            raise RuntimeError("небезопасный путь файла плагина")
+        return target
+
+    def fetch_limited_json(url: str):
+        request = Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "LotsManager-Updater"})
+        with urlopen(request, timeout=15) as response:
+            if response.geturl() != url:
+                raise RuntimeError("GitHub API перенаправил запрос")
+            payload = response.read(256 * 1024 + 1)
+        if len(payload) > 256 * 1024:
+            raise RuntimeError("ответ GitHub API слишком большой")
+        return json.loads(payload.decode("utf-8"))
+
+    def fetch_limited_source(url: str) -> str:
+        request = Request(url, headers={"Accept": "text/plain", "User-Agent": "LotsManager-Updater"})
+        with urlopen(request, timeout=20) as response:
+            if response.geturl() != url:
+                raise RuntimeError("GitHub Raw перенаправил запрос")
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > UPDATER_MAX_BYTES:
+                raise RuntimeError("файл обновления слишком большой")
+            payload = response.read(UPDATER_MAX_BYTES + 1)
+        if len(payload) > UPDATER_MAX_BYTES:
+            raise RuntimeError("файл обновления слишком большой")
+        return payload.decode("utf-8")
+
+    def check_and_install_update() -> dict:
+        if not updater_lock.acquire(blocking=False):
+            return {"status": "busy"}
+        try:
+            api_url, _ = build_update_urls("0" * 40)
+            commits = fetch_limited_json(api_url)
+            if not isinstance(commits, list) or not commits:
+                raise RuntimeError("GitHub не вернул историю файла")
+            if not isinstance(commits[0], dict):
+                raise RuntimeError("GitHub вернул некорректный commit")
+            commit_sha = str(commits[0].get("sha") or "")
+            _, raw_url = build_update_urls(commit_sha)
+            source = fetch_limited_source(raw_url)
+            metadata = validate_update_source(source)
+            if (updater_settings.get("last_commit") == commit_sha and
+                    updater_settings.get("last_version") == metadata["VERSION"]):
+                return {"status": "current", "version": metadata["VERSION"]}
+            if version_tuple(metadata["VERSION"]) <= version_tuple(VERSION):
+                updater_settings.update({
+                    "last_checked_at": int(time.time()), "last_commit": commit_sha,
+                    "last_version": metadata["VERSION"],
+                })
+                save_updater_settings()
+                return {"status": "current", "version": metadata["VERSION"]}
+
+            target = resolve_plugin_path()
+            current_bytes = target.read_bytes()
+            current_source = current_bytes.decode("utf-8")
+            validate_update_source(current_source)
+            backup = target.with_name(f"{target.name}.backup-{VERSION}-{token_hex(6)}")
+            temp_path = None
+            try:
+                shutil.copy2(target, backup)
+                if hashlib.sha256(backup.read_bytes()).hexdigest() != hashlib.sha256(current_bytes).hexdigest():
+                    raise RuntimeError("резервная копия повреждена")
+                source_bytes = source.encode("utf-8")
+                with NamedTemporaryFile("wb", dir=target.parent, prefix=f".{target.name}.",
+                                       suffix=".update", delete=False) as temp:
+                    temp.write(source_bytes)
+                    temp.flush()
+                    import os
+                    os.fsync(temp.fileno())
+                    temp_path = Path(temp.name)
+                if hashlib.sha256(temp_path.read_bytes()).hexdigest() != hashlib.sha256(source_bytes).hexdigest():
+                    raise RuntimeError("контрольная сумма временного файла не совпала")
+                replace(str(temp_path), str(target))
+                temp_path = None
+                validate_update_source(target.read_text(encoding="utf-8"))
+            except Exception:
+                if backup.exists():
+                    rollback_temp = None
+                    try:
+                        with NamedTemporaryFile("wb", dir=target.parent, prefix=f".{target.name}.",
+                                               suffix=".rollback", delete=False) as rollback:
+                            rollback.write(backup.read_bytes())
+                            rollback.flush()
+                            import os
+                            os.fsync(rollback.fileno())
+                            rollback_temp = Path(rollback.name)
+                        replace(str(rollback_temp), str(target))
+                        rollback_temp = None
+                    finally:
+                        if rollback_temp and rollback_temp.exists():
+                            rollback_temp.unlink()
+                raise
+            finally:
+                if temp_path and temp_path.exists():
+                    temp_path.unlink()
+            updater_settings.update({
+                "last_checked_at": int(time.time()), "last_commit": commit_sha,
+                "last_version": metadata["VERSION"],
+            })
+            save_updater_settings()
+            return {"status": "installed", "version": metadata["VERSION"], "backup": str(backup)}
+        finally:
+            updater_lock.release()
+
+    def updater_result_text(result: dict) -> str:
+        status = result.get("status")
+        if status == "installed":
+            return f"✅ Установлена версия <b>{html_text(result['version'])}</b>. Перезапустите Cardinal командой /restart."
+        if status == "current":
+            return f"✅ Установлена актуальная версия <b>{html_text(VERSION)}</b>."
+        if status == "busy":
+            return "⏳ Проверка обновлений уже выполняется."
+        return "❌ Неизвестный результат проверки."
+
+    def maybe_auto_update(chat_id: int):
+        if updater_settings.get("consent") != "accepted" or not updater_settings.get("enabled"):
+            return
+        if time.time() - float(updater_settings.get("last_checked_at") or 0) < UPDATER_CHECK_INTERVAL:
+            return
+        def worker():
+            try:
+                result = check_and_install_update()
+                if result.get("status") == "installed":
+                    bot.send_message(chat_id, updater_result_text(result), parse_mode="HTML")
+            except Exception as exc:
+                logger.error("[LOTS UPDATER] Автопроверка не удалась: %s", exc, exc_info=True)
+        threading.Thread(target=worker, name="LotsManagerUpdater", daemon=True).start()
+
+    def gate_first_use(message) -> bool:
+        if updater_settings.get("consent") == "unknown":
+            ask_updater_consent(message.chat.id)
+            return False
+        maybe_auto_update(message.chat.id)
+        return True
+
+    load_updater_settings()
+
+    def is_unconsented_plugin_callback(call) -> bool:
+        data = str(getattr(call, "data", "") or "")
+        is_plugin_callback = data.startswith(("ml_", "mm_", "lots_copy_plugin."))
+        return updater_settings.get("consent") == "unknown" and is_plugin_callback
+
+    @bot.callback_query_handler(func=is_unconsented_plugin_callback)
+    def callback_first_use_consent(call):
+        bot.answer_callback_query(call.id, "Сначала выберите настройку обновлений")
+        ask_updater_consent(call.message.chat.id)
 
     def format_seconds(seconds: float) -> str:
         seconds = max(int(seconds), 0)
@@ -629,26 +1138,12 @@ def init_commands(cardinal: Cardinal):
 
     def format_subcategory_line(subcategory_id: int) -> str:
         name = get_subcategory_display_name(subcategory_id)
-        return f"• <code>{subcategory_id}</code> — {name}"
+        return f"• <code>{subcategory_id}</code> — {html_text(name)}"
 
     def format_subcategory_button_text(subcategory_id: int) -> str:
         name = get_subcategory_display_name(subcategory_id)
         text = f"➖ {subcategory_id} · {name}"
         return text if len(text) <= 60 else text[:57] + "..."
-
-    def parse_subcategory_ids_input(text: str):
-        payload = text.replace("\n", " ").replace(",", " ")
-        parts = [part.strip() for part in payload.split() if part.strip()]
-        parsed_ids = []
-        invalid_parts = []
-
-        for part in parts:
-            try:
-                parsed_ids.append(int(part))
-            except ValueError:
-                invalid_parts.append(part)
-
-        return parsed_ids, invalid_parts
 
     def render_subcategory_settings_text() -> str:
         configured_ids = get_configured_subcategory_ids()
@@ -661,13 +1156,13 @@ def init_commands(cardinal: Cardinal):
             "🗂️ <b>Подкатегории для поиска лотов</b>\n\n"
             f"<b>ID из настроек:</b>\n{configured_text}\n\n"
             f"<b>Автопоиск по найденным лотам:</b> {discovered_text}\n\n"
-            "Добавляй ID вручную, если надо искать лоты только в нужных подкатегориях."
+            "Добавляй разделы по названию или ID, чтобы плагин всегда искал в них лоты."
         )
 
     def create_subcategory_settings_keyboard():
         keyboard = telebot.types.InlineKeyboardMarkup(row_width=1)
         keyboard.row(
-            telebot.types.InlineKeyboardButton("➕ Добавить ID", callback_data=CB_SUBCAT_ADD),
+            telebot.types.InlineKeyboardButton("➕ Добавить раздел", callback_data=CB_SUBCAT_ADD),
             telebot.types.InlineKeyboardButton(
                 f"🔄 Автопоиск: {'Вкл' if settings.get('lot_search_use_discovered_ids', True) else 'Выкл'}",
                 callback_data=CB_SUBCAT_DISCOVERED_TOGGLE
@@ -797,6 +1292,53 @@ def init_commands(cardinal: Cardinal):
                 bot.send_message(chat_id, f"❌ Не удалось получить данные о лоте {lot_id}. Проверьте логи.")
             raise Exception(f"Failed to get lot {lot_id} after 3 attempts")
 
+    def get_lot_select_schema(lot_id: int) -> list[dict]:
+        # Do not pass locale here: Cardinal uses the account's current RU/EN locale,
+        # and forcing one would mutate the shared FunPay session for other plugins.
+        response = cardinal.account.method(
+            "get", f"lots/offerEdit?offer={lot_id}", {}, {}, raise_not_200=True
+        )
+        return parse_lot_select_fields(response.content.decode(errors="replace"))
+
+    def common_subcategories() -> list:
+        groups = cardinal.account.get_sorted_subcategories()
+        common_key = FunPayAPI.types.SubCategoryTypes.COMMON
+        values = groups.get(common_key, {})
+        return list(values.values()) if isinstance(values, dict) else list(values)
+
+    def search_common_subcategories(query: str) -> list:
+        normalized = str(query or "").strip().casefold()
+        categories = common_subcategories()
+        if normalized.isdigit():
+            return [item for item in categories if item.id == int(normalized)]
+        return [item for item in categories if normalized in str(item.ui_name).casefold()][:20]
+
+    def load_new_lot_form(subcategory_id: int) -> tuple[str, dict, list[dict]]:
+        # Labels/options intentionally follow the account's current RU/EN locale.
+        trade = cardinal.account.method(
+            "get", f"lots/{subcategory_id}/trade", {"accept": "*/*"}, {}, raise_not_200=True
+        )
+        trade_html = trade.content.decode(errors="replace")
+        create_url = discover_lot_create_url(trade_html)
+        if not create_url:
+            raise RuntimeError("FunPay не предоставил ссылку новой формы для этого раздела")
+        response = cardinal.account.method("get", create_url, {}, {}, raise_not_200=True)
+        html_source = response.content.decode(errors="replace")
+        fields = parse_lot_form_defaults(html_source)
+        if not fields or str(fields.get("node_id") or subcategory_id) != str(subcategory_id):
+            raise RuntimeError("FunPay вернул неподходящую форму создания")
+        fields["node_id"] = str(subcategory_id)
+        fields["offer_id"] = "0"
+        fields["csrf_token"] = cardinal.account.csrf_token
+        schema = parse_lot_select_fields(html_source)
+        supported = set(fields) | {
+            "fields[summary][ru]", "fields[summary][en]", "fields[desc][ru]", "fields[desc][en]", "price"
+        }
+        missing = unsupported_required_lot_fields(html_source, supported)
+        if missing:
+            raise RuntimeError("форма содержит неподдерживаемые обязательные поля: " + ", ".join(missing[:5]))
+        return create_url, fields, schema
+
     def save_lot_changes(lot_fields, chat_id: int = None):
         """Сохраняет изменения лота на месте без удаления и пересоздания."""
         attempts = 3
@@ -819,9 +1361,47 @@ def init_commands(cardinal: Cardinal):
         """Обновляет кэш списка лотов для пользователя."""
         lots = get_all_lots(chat_id, force_refresh=True, progress_tracker=progress_tracker, progress_status=progress_status)
         state = get_user_state(user_id)
-        state['lots'] = lots
+        state['all_lots'] = list(lots)
+        filters = state.setdefault('lot_filters', dict(DEFAULT_LOT_FILTERS))
+        state['lots'] = apply_lot_filters(state['all_lots'], filters)
         state['page'] = 0
-        return lots
+        return state['lots']
+
+    def refresh_filtered_lots(user_id: int):
+        state = get_user_state(user_id)
+        filters = state.setdefault('lot_filters', dict(DEFAULT_LOT_FILTERS))
+        state['lots'] = apply_lot_filters(state.get('all_lots', []), filters)
+        state['page'] = 0
+        clear_selected_lots(user_id)
+        return state['lots']
+
+    def format_range(minimum, maximum, suffix=""):
+        if minimum is None and maximum is None:
+            return "любая"
+        if minimum is None:
+            return f"до {maximum:g}{suffix}"
+        if maximum is None:
+            return f"от {minimum:g}{suffix}"
+        return f"{minimum:g}–{maximum:g}{suffix}"
+
+    def sort_label(sort_mode: str) -> str:
+        return {
+            "default": "по умолчанию",
+            "price_asc": "цена: дешевле → дороже",
+            "price_desc": "цена: дороже → дешевле",
+            "alpha_asc": "название: А → Я",
+            "alpha_desc": "название: Я → А",
+            "length_asc": "сначала короткие названия",
+            "length_desc": "сначала длинные названия",
+        }.get(sort_mode, "по умолчанию")
+
+    def active_filter_count(filters: dict) -> int:
+        return sum((
+            filters.get("status", "all") != "all",
+            bool(str(filters.get("title_query") or "").strip()),
+            filters.get("price_min") is not None or filters.get("price_max") is not None,
+            filters.get("title_len_min") is not None or filters.get("title_len_max") is not None,
+        ))
     
     def validate_price(price_str: str):
         return validate_price_value(price_str)
@@ -838,17 +1418,81 @@ def init_commands(cardinal: Cardinal):
             return False, f"❌ Максимальная длина описания: {LIMITS['desc_max']} символов"
         return True, ""
 
-    def render_manage_lots_text(lots, prefix_text: str | None = None):
+    def render_manage_lots_text(lots, prefix_text: str | None = None, state: dict | None = None):
+        state = state or {}
+        all_lots = state.get('all_lots', lots)
+        filters = state.get('lot_filters', DEFAULT_LOT_FILTERS)
+        title_query = filters.get('title_query')
+        search_label = f"<b>{html_text(title_query)}</b>" if title_query else "нет"
         text = ""
         if prefix_text:
             text += f"{prefix_text}\n\n"
+        if not lots and all_lots:
+            text += (
+                "📭 <b>По выбранным фильтрам лоты не найдены</b>\n\n"
+                f"Всего в аккаунте: <b>{len(all_lots)}</b>\n"
+                "Измените параметры через кнопку «Фильтры» или сбросьте их в меню.\n\n"
+            )
         text += (
-            f"📋 <b>Управление лотами</b>\n\nВсего лотов: {len(lots)}\n"
-            f"Активных: {sum(1 for l in lots if l.active)}\n"
-            f"Неактивных: {sum(1 for l in lots if not l.active)}\n\n"
-            f"Выберите лот для управления\nили используйте массовые действия ниже."
+            f"📋 <b>Управление лотами</b>\n\n"
+            f"Показано: <b>{len(lots)} из {len(all_lots)}</b>\n"
+            f"🟢 {sum(1 for l in lots if l.active)} · 🔴 {sum(1 for l in lots if not l.active)}\n\n"
+            f"<b>Фильтры:</b> статус — { {'all': 'все', 'active': 'активные', 'inactive': 'неактивные'}.get(filters.get('status'), 'все') }; "
+            f"поиск — {search_label}; "
+            f"цена — {format_range(filters.get('price_min'), filters.get('price_max'), ' ₽')}; "
+            f"длина — {format_range(filters.get('title_len_min'), filters.get('title_len_max'), ' симв.')}\n"
+            f"<b>Сортировка:</b> {sort_label(filters.get('sort', 'default'))}"
         )
         return text
+
+    def render_filter_menu_text(state: dict) -> str:
+        filters = state['lot_filters']
+        return (
+            "🔎 <b>Фильтры и сортировка</b>\n\n"
+            f"Найдено: <b>{len(state.get('lots', []))} из {len(state.get('all_lots', []))}</b>\n\n"
+            f"Статус: <b>{ {'all': 'все', 'active': 'активные', 'inactive': 'неактивные'}[filters['status']]}</b>\n"
+            f"Поиск: <b>{html_text(filters.get('title_query') or 'не задан')}</b>\n"
+            f"Цена: <b>{format_range(filters['price_min'], filters['price_max'], ' ₽')}</b>\n"
+            f"Длина названия: <b>{format_range(filters['title_len_min'], filters['title_len_max'], ' симв.')}</b>\n"
+            f"Сортировка: <b>{sort_label(filters['sort'])}</b>"
+        )
+
+    def create_filter_keyboard(filters: dict, result_count: int):
+        keyboard = telebot.types.InlineKeyboardMarkup(row_width=2)
+        status = filters['status']
+        keyboard.row(
+            telebot.types.InlineKeyboardButton(f"{'✓ ' if status == 'all' else ''}Все", callback_data=f"{CB_FILTER_STATUS}:all"),
+            telebot.types.InlineKeyboardButton(f"{'✓ ' if status == 'active' else ''}Активные", callback_data=f"{CB_FILTER_STATUS}:active"),
+            telebot.types.InlineKeyboardButton(f"{'✓ ' if status == 'inactive' else ''}Неактивные", callback_data=f"{CB_FILTER_STATUS}:inactive")
+        )
+        query = str(filters.get('title_query') or '').strip()
+        query_preview = query if len(query) <= 24 else query[:23] + "…"
+        keyboard.row(telebot.types.InlineKeyboardButton(
+            f"🔎 Название: {query_preview or 'не задан'}", callback_data=CB_FILTER_TITLE
+        ))
+        if query:
+            keyboard.row(telebot.types.InlineKeyboardButton("✖ Очистить поиск", callback_data=CB_FILTER_TITLE_CLEAR))
+        keyboard.row(
+            telebot.types.InlineKeyboardButton(f"💰 От: {filters['price_min'] if filters['price_min'] is not None else '—'}", callback_data=f"{CB_FILTER_PRICE}:min"),
+            telebot.types.InlineKeyboardButton(f"💰 До: {filters['price_max'] if filters['price_max'] is not None else '—'}", callback_data=f"{CB_FILTER_PRICE}:max")
+        )
+        keyboard.row(
+            telebot.types.InlineKeyboardButton(f"🔤 От: {filters['title_len_min'] if filters['title_len_min'] is not None else '—'}", callback_data=f"{CB_FILTER_LENGTH}:min"),
+            telebot.types.InlineKeyboardButton(f"🔤 До: {filters['title_len_max'] if filters['title_len_max'] is not None else '—'}", callback_data=f"{CB_FILTER_LENGTH}:max")
+        )
+        sort_rows = [
+            ("default", "По умолчанию"), ("price_asc", "Цена ↑"), ("price_desc", "Цена ↓"),
+            ("alpha_asc", "А–Я"), ("alpha_desc", "Я–А"),
+            ("length_asc", "Короткие"), ("length_desc", "Длинные"),
+        ]
+        for index in range(0, len(sort_rows), 2):
+            buttons = [telebot.types.InlineKeyboardButton(
+                f"{'✓ ' if filters['sort'] == value else ''}{label}", callback_data=f"{CB_FILTER_SORT}:{value}"
+            ) for value, label in sort_rows[index:index + 2]]
+            keyboard.row(*buttons)
+        keyboard.row(telebot.types.InlineKeyboardButton("🧹 Сбросить", callback_data=CB_FILTER_RESET))
+        keyboard.row(telebot.types.InlineKeyboardButton(f"✅ Показать ({result_count})", callback_data=f"{CB_PAGE}:0"))
+        return keyboard
 
     def create_bulk_actions_keyboard():
         keyboard = telebot.types.InlineKeyboardMarkup(row_width=2)
@@ -867,10 +1511,22 @@ def init_commands(cardinal: Cardinal):
         lots = update_cached_lots_for_user(user_id, call.message.chat.id)
         if not lots:
             clear_selected_lots(user_id)
+            state = get_user_state(user_id)
+            all_count = len(state.get('all_lots', []))
+            if all_count:
+                keyboard = telebot.types.InlineKeyboardMarkup().row(
+                    telebot.types.InlineKeyboardButton("🔎 Изменить фильтры", callback_data=CB_FILTER_MENU),
+                    telebot.types.InlineKeyboardButton("🧹 Сбросить", callback_data=CB_FILTER_RESET)
+                )
+                text = f"📭 По текущим фильтрам лоты не найдены.\n\nВсего в аккаунте: {all_count}."
+            else:
+                keyboard = None
+                text = "📭 Лотов нет.\n\nНет ни активных, ни скрытых лотов."
             bot.edit_message_text(
-                "📭 Лотов нет.\n\nНет ни активных, ни скрытых лотов.",
+                text,
                 call.message.chat.id,
-                call.message.message_id
+                call.message.message_id,
+                reply_markup=keyboard
             )
             return lots
         if page is None:
@@ -880,7 +1536,7 @@ def init_commands(cardinal: Cardinal):
         user_data[user_id]['page'] = page
         keyboard = create_lots_keyboard(lots, page, selection_mode=is_selection_mode(user_id), selected_ids=get_selected_lot_ids(user_id))
         bot.edit_message_text(
-            render_manage_lots_text(lots, notice),
+            render_manage_lots_text(lots, notice, state=user_data[user_id]),
             call.message.chat.id,
             call.message.message_id,
             reply_markup=keyboard,
@@ -1061,17 +1717,21 @@ def init_commands(cardinal: Cardinal):
         for lot in page_lots:
             status = "🟢" if lot.active else "🔴"
             prefix = "✅" if lot.id in selected_ids else "⬜"
-            text = f"{status} {lot.description[:40]}... | {lot.price} {lot.currency}"
+            title = lot_title(lot)
+            title_preview = title[:36] + "…" if len(title) > 36 else title
+            text = f"{status} {title_preview} · {lot.price} {lot.currency}"
             if selection_mode:
                 keyboard.add(telebot.types.InlineKeyboardButton(f"{prefix} {text}", callback_data=f"{CB_SELECT_TOGGLE}:{lot.id}"))
             else:
                 keyboard.add(telebot.types.InlineKeyboardButton(text, callback_data=f"{CB_LOT_VIEW}:{lot.id}"))
         
         nav_buttons = []
+        total_pages = max((len(lots) - 1) // per_page + 1, 1)
         if page > 0:
-            nav_buttons.append(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=f"{CB_PAGE}:{page-1}"))
+            nav_buttons.append(telebot.types.InlineKeyboardButton("‹", callback_data=f"{CB_PAGE}:{page-1}"))
+        nav_buttons.append(telebot.types.InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
         if end_idx < len(lots):
-            nav_buttons.append(telebot.types.InlineKeyboardButton("Вперёд ➡️", callback_data=f"{CB_PAGE}:{page+1}"))
+            nav_buttons.append(telebot.types.InlineKeyboardButton("›", callback_data=f"{CB_PAGE}:{page+1}"))
         
         if nav_buttons:
             keyboard.row(*nav_buttons)
@@ -1087,13 +1747,17 @@ def init_commands(cardinal: Cardinal):
             )
         else:
             keyboard.row(
+                telebot.types.InlineKeyboardButton("🔎 Фильтры", callback_data=CB_FILTER_MENU)
+            )
+            keyboard.row(
                 telebot.types.InlineKeyboardButton("⚙️ Массово", callback_data=CB_BULK_MENU),
                 telebot.types.InlineKeyboardButton("✅ Выбрать", callback_data=CB_SELECT_MODE)
             )
             keyboard.row(
-                telebot.types.InlineKeyboardButton("➕ Добавить", callback_data=CB_ADD_LOTS),
+                telebot.types.InlineKeyboardButton("➕ Создать", callback_data=CB_CREATE_NEW),
                 telebot.types.InlineKeyboardButton("🗂️ Подкатегории", callback_data=CB_SUBCAT_MENU)
             )
+            keyboard.row(telebot.types.InlineKeyboardButton("📥 Импорт из JSON", callback_data=CB_ADD_LOTS))
             keyboard.row(telebot.types.InlineKeyboardButton("🔄 Обновить", callback_data=f"{CB_PAGE}:{page}"))
         return keyboard
     
@@ -1105,6 +1769,9 @@ def init_commands(cardinal: Cardinal):
         )
         keyboard.row(
             telebot.types.InlineKeyboardButton("📝 Изменить описание", callback_data=f"{CB_LOT_EDIT_DESC}:{lot_id}")
+        )
+        keyboard.row(
+            telebot.types.InlineKeyboardButton("🧩 Поля FunPay", callback_data=f"{CB_LOT_FIELDS}:{lot_id}")
         )
         toggle_text = "🔴 Отключить лот" if is_active else "🟢 Включить лот"
         keyboard.row(telebot.types.InlineKeyboardButton(toggle_text, callback_data=f"{CB_LOT_TOGGLE}:{lot_id}"))
@@ -1159,7 +1826,9 @@ def init_commands(cardinal: Cardinal):
                 "⚙️ <b>Раздел: Настройки</b>\n\n"
                 "• подкатегории поиска лотов\n"
                 "• теги лотов\n"
-                f"• автовыдача при копировании: {'🟢 включена' if secrets_enabled else '🔴 выключена'}"
+                f"• автовыдача при копировании: {'🟢 включена' if secrets_enabled else '🔴 выключена'}\n"
+                f"• автообновления: {'🟢 включены' if updater_settings.get('enabled') else '🔴 выключены'}\n"
+                f"• версия LotsManager: <b>{html_text(VERSION)}</b>"
             ),
             "history": (
                 "🕘 <b>Раздел: История</b>\n\n"
@@ -1210,6 +1879,13 @@ def init_commands(cardinal: Cardinal):
                     callback_data=f"{CB_MENU_ACTION}:copy_with_secrets"
                 ),
                 telebot.types.InlineKeyboardButton("❓ Справка по тегам", callback_data=f"{CB_MENU_ACTION}:tags_help")
+            )
+            keyboard.row(
+                telebot.types.InlineKeyboardButton(
+                    f"🔄 Автообновления: {'🟢 Вкл' if updater_settings.get('enabled') else '🔴 Выкл'}",
+                    callback_data=UPDATER_CB_TOGGLE
+                ),
+                telebot.types.InlineKeyboardButton("⬇️ Проверить сейчас", callback_data=UPDATER_CB_CHECK)
             )
         elif section == "history":
             keyboard.row(
@@ -1929,14 +2605,17 @@ def init_commands(cardinal: Cardinal):
                 return
             
             state = get_user_state(m.from_user.id)
-            state['lots'] = lots
+            state['all_lots'] = list(lots)
+            filters = state.setdefault('lot_filters', dict(DEFAULT_LOT_FILTERS))
+            state['lots'] = apply_lot_filters(state['all_lots'], filters)
             state['page'] = 0
             clear_selected_lots(m.from_user.id)
             
-            keyboard = create_lots_keyboard(lots, 0, selection_mode=False, selected_ids=[])
+            visible_lots = state['lots']
+            keyboard = create_lots_keyboard(visible_lots, 0, selection_mode=False, selected_ids=[])
             bot.send_message(
                 m.chat.id,
-                render_manage_lots_text(lots),
+                render_manage_lots_text(visible_lots, state=state),
                 reply_markup=keyboard,
                 parse_mode="HTML"
             )
@@ -2039,14 +2718,19 @@ def init_commands(cardinal: Cardinal):
         try:
             page = int(call.data.split(":")[1])
             user_id = call.from_user.id
+            state = get_user_state(user_id)
+            if state.pop('pending_filter_input', None) is not None:
+                tg.clear_state(call.message.chat.id, user_id, True)
             if user_id not in user_data or 'lots' not in user_data[user_id]:
                 bot.answer_callback_query(call.id, "❌ Данные устарели. Используйте /manage_lots")
                 return
             lots = user_data[user_id]['lots']
+            max_page = max((len(lots) - 1) // 8, 0)
+            page = max(0, min(page, max_page))
             user_data[user_id]['page'] = page
             keyboard = create_lots_keyboard(lots, page, selection_mode=is_selection_mode(user_id), selected_ids=get_selected_lot_ids(user_id))
             bot.edit_message_text(
-                render_manage_lots_text(lots),
+                render_manage_lots_text(lots, state=user_data[user_id]),
                 call.message.chat.id,
                 call.message.message_id,
                 reply_markup=keyboard,
@@ -2065,22 +2749,59 @@ def init_commands(cardinal: Cardinal):
             lot_fields = get_lot_fields_by_id(lot_id, call.message.chat.id)
             fields = lot_fields.fields
             
-            # Правильное получение полей
-            title = fields.get('fields[summary][ru]', fields.get('fields[summary][en]', 'Без названия'))
-            desc = fields.get('fields[desc][ru]', fields.get('fields[desc][en]', 'Без описания'))
+            title_ru = str(fields.get('fields[summary][ru]') or '')
+            title_en = str(fields.get('fields[summary][en]') or '')
+            desc_ru = str(fields.get('fields[desc][ru]') or '')
+            desc_en = str(fields.get('fields[desc][en]') or '')
+            title = title_ru or title_en or 'Без названия'
             price = fields.get('price', '0')
             
             active = lot_fields.active
             
             logger.info(f"[LOTS] Лот {lot_id}: active={active}, title='{title[:50]}...', price={price}")
             
-            if len(desc) > 500:
-                desc = desc[:500] + "..."
             status = "🟢 Активен" if active else "🔴 Неактивен"
+            def field_metric(value: str, maximum: int, minimum: int | None = None) -> str:
+                length = len(value)
+                warning = ""
+                if minimum is not None and value and length < minimum:
+                    warning = f" · ⚠️ минимум {minimum}"
+                elif length > maximum:
+                    warning = f" · ⚠️ превышено на {length - maximum}"
+                elif not value:
+                    warning = " · не заполнено"
+                return f"{length}/{maximum}{warning}"
+
+            valid_price, _, numeric_price = validate_price_value(price)
+            price_warning = "" if valid_price else " · ⚠️ вне лимита"
+            desc_preview = desc_ru or desc_en
+            if len(desc_preview) > 350:
+                desc_preview = desc_preview[:350] + "…"
+            try:
+                dynamic_fields = get_lot_select_schema(lot_id)
+            except Exception:
+                logger.debug("Не удалось загрузить дополнительные поля лота", exc_info=True)
+                dynamic_fields = []
+            dynamic_text = ""
+            if dynamic_fields:
+                dynamic_text = "\n<b>Поля FunPay</b>\n" + "\n".join(
+                    f"• {html_text(item['label'])}: <b>{html_text(item['value_label'] or '—')}</b>"
+                    for item in dynamic_fields
+                ) + "\n"
             message = (
-                f"📦 <b>Лот #{lot_id}</b>\n\n<b>Статус:</b> {status}\n"
-                f"<b>Название:</b> {html_text(title)}\n<b>Цена:</b> {html_text(price)} ₽\n"
-                f"<b>Описание:</b>\n{html_text(desc)}\n\n"
+                f"📦 <b>Лот #{lot_id}</b>\n{status}\n\n"
+                f"<b>Цена:</b> {html_text(price)} ₽{price_warning}\n"
+                f"Допустимо: {LIMITS['price_min']:g}–{LIMITS['price_max']:g} ₽\n\n"
+                f"<b>Название</b>\n"
+                f"🇷🇺 {field_metric(title_ru, LIMITS['title_max'], LIMITS['title_min'])}\n"
+                f"{html_text(title_ru or '—')}\n\n"
+                f"🇬🇧 {field_metric(title_en, LIMITS['title_max'], LIMITS['title_min'])}\n"
+                f"{html_text(title_en or '—')}\n\n"
+                f"<b>Описание</b>\n"
+                f"🇷🇺 {field_metric(desc_ru, LIMITS['desc_max'])}\n"
+                f"🇬🇧 {field_metric(desc_en, LIMITS['desc_max'])}\n"
+                f"<b>Превью:</b>\n{html_text(desc_preview or '—')}\n\n"
+                f"{dynamic_text}\n"
                 f"<a href=\"https://funpay.com/lots/offer?id={lot_id}\">🔗 Открыть на FunPay</a>"
             )
             keyboard = create_lot_view_keyboard(lot_id, active)
@@ -2255,6 +2976,102 @@ def init_commands(cardinal: Cardinal):
             logger.debug("TRACEBACK", exc_info=True)
             bot.answer_callback_query(call.id, "❌ Ошибка")
 
+    @bot.callback_query_handler(func=lambda c: c.data == "noop")
+    def callback_noop(call):
+        bot.answer_callback_query(call.id)
+
+    def show_filter_menu(call):
+        state = get_user_state(call.from_user.id)
+        if state.pop('pending_filter_input', None) is not None:
+            tg.clear_state(call.message.chat.id, call.from_user.id, True)
+        state.setdefault('lot_filters', dict(DEFAULT_LOT_FILTERS))
+        state.setdefault('all_lots', state.get('lots', []))
+        state['lots'] = apply_lot_filters(state['all_lots'], state['lot_filters'])
+        bot.edit_message_text(
+            render_filter_menu_text(state), call.message.chat.id, call.message.message_id,
+            parse_mode="HTML", reply_markup=create_filter_keyboard(state['lot_filters'], len(state['lots']))
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data == CB_FILTER_MENU)
+    def callback_filter_menu(call):
+        show_filter_menu(call)
+        bot.answer_callback_query(call.id)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{CB_FILTER_STATUS}:"))
+    def callback_filter_status(call):
+        value = call.data.rsplit(":", 1)[1]
+        if value in {"all", "active", "inactive"}:
+            get_user_state(call.from_user.id).setdefault('lot_filters', dict(DEFAULT_LOT_FILTERS))['status'] = value
+            refresh_filtered_lots(call.from_user.id)
+        show_filter_menu(call)
+        bot.answer_callback_query(call.id)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{CB_FILTER_SORT}:"))
+    def callback_filter_sort(call):
+        value = call.data.rsplit(":", 1)[1]
+        if value in {"default", "price_asc", "price_desc", "alpha_asc", "alpha_desc", "length_asc", "length_desc"}:
+            get_user_state(call.from_user.id).setdefault('lot_filters', dict(DEFAULT_LOT_FILTERS))['sort'] = value
+            refresh_filtered_lots(call.from_user.id)
+        show_filter_menu(call)
+        bot.answer_callback_query(call.id)
+
+    def start_filter_value_input(call, kind: str, boundary: str):
+        if boundary not in {"min", "max"}:
+            bot.answer_callback_query(call.id, "❌ Некорректная граница фильтра")
+            return False
+        state = get_user_state(call.from_user.id)
+        state['pending_filter_input'] = {"kind": kind, "boundary": boundary, "message_id": call.message.message_id}
+        if kind == "price":
+            prompt = "💰 Отправьте цену числом или <code>-</code>, чтобы убрать границу."
+        else:
+            prompt = f"🔤 Отправьте количество символов от 0 до {LIMITS['title_max']} или <code>-</code>, чтобы убрать границу."
+        result = bot.send_message(call.message.chat.id, prompt, parse_mode="HTML", reply_markup=skb.CLEAR_STATE_BTN())
+        tg.set_state(call.message.chat.id, result.id, call.from_user.id, CBT_FILTER_VALUE)
+        return True
+
+    @bot.callback_query_handler(func=lambda c: c.data == CB_FILTER_TITLE)
+    def callback_filter_title(call):
+        state = get_user_state(call.from_user.id)
+        state['pending_filter_input'] = {"kind": "title", "message_id": call.message.message_id}
+        result = bot.send_message(
+            call.message.chat.id,
+            f"🔎 Отправьте часть названия лота (до {LIMITS['title_max']} символов) или <code>-</code>, чтобы очистить поиск.",
+            parse_mode="HTML",
+            reply_markup=skb.CLEAR_STATE_BTN()
+        )
+        tg.set_state(call.message.chat.id, result.id, call.from_user.id, CBT_FILTER_VALUE)
+        bot.answer_callback_query(call.id)
+
+    @bot.callback_query_handler(func=lambda c: c.data == CB_FILTER_TITLE_CLEAR)
+    def callback_filter_title_clear(call):
+        state = get_user_state(call.from_user.id)
+        state.setdefault('lot_filters', dict(DEFAULT_LOT_FILTERS))['title_query'] = None
+        state.pop('pending_filter_input', None)
+        tg.clear_state(call.message.chat.id, call.from_user.id, True)
+        refresh_filtered_lots(call.from_user.id)
+        show_filter_menu(call)
+        bot.answer_callback_query(call.id, "✅ Поиск очищен")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{CB_FILTER_PRICE}:"))
+    def callback_filter_price(call):
+        if start_filter_value_input(call, "price", call.data.rsplit(":", 1)[1]):
+            bot.answer_callback_query(call.id)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{CB_FILTER_LENGTH}:"))
+    def callback_filter_length(call):
+        if start_filter_value_input(call, "length", call.data.rsplit(":", 1)[1]):
+            bot.answer_callback_query(call.id)
+
+    @bot.callback_query_handler(func=lambda c: c.data == CB_FILTER_RESET)
+    def callback_filter_reset(call):
+        state = get_user_state(call.from_user.id)
+        state['lot_filters'] = dict(DEFAULT_LOT_FILTERS)
+        state.pop('pending_filter_input', None)
+        tg.clear_state(call.message.chat.id, call.from_user.id, True)
+        refresh_filtered_lots(call.from_user.id)
+        show_filter_menu(call)
+        bot.answer_callback_query(call.id, "✅ Фильтры сброшены")
+
     @bot.callback_query_handler(func=lambda c: c.data.startswith(CB_LOT_EDIT_PRICE))
     def callback_edit_price(call):
         try:
@@ -2294,7 +3111,7 @@ def init_commands(cardinal: Cardinal):
             result = bot.send_message(
                 call.message.chat.id,
                 f"✏️ <b>Изменение русского названия лота #{lot_id}</b>\n\n"
-                f"Текущее название (RU):\n<b>{current_title_ru}</b>\n\n"
+                f"Текущее название (RU):\n<b>{html_text(current_title_ru)}</b>\n\n"
                 f"📝 Отправьте новое русское название:\n"
                 f"• Минимум: {LIMITS['title_min']} символов\n"
                 f"• Максимум: {LIMITS['title_max']} символов\n\n"
@@ -2333,8 +3150,8 @@ def init_commands(cardinal: Cardinal):
             
             bot.edit_message_text(
                 f"✏️ <b>Изменение названия лота #{lot_id}</b>\n\n"
-                f"<b>Текущее название (RU):</b>\n{current_title_ru}\n\n"
-                f"<b>Текущее название (EN):</b>\n{current_title_en}\n\n"
+                f"<b>Текущее название (RU):</b>\n{html_text(current_title_ru)}\n\n"
+                f"<b>Текущее название (EN):</b>\n{html_text(current_title_en)}\n\n"
                 f"Выберите язык для редактирования:",
                 call.message.chat.id,
                 call.message.message_id,
@@ -2344,6 +3161,217 @@ def init_commands(cardinal: Cardinal):
         except:
             logger.debug("TRACEBACK", exc_info=True)
             bot.answer_callback_query(call.id, "❌ Ошибка")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{CB_LOT_FIELDS}:"))
+    def callback_lot_fields(call):
+        try:
+            if not getattr(call, "_lots_manager_callback_answered", False):
+                bot.answer_callback_query(call.id, "⏳ Загружаю поля...")
+            lot_id = int(call.data.rsplit(":", 1)[1])
+            schema = get_lot_select_schema(lot_id)
+            state = get_user_state(call.from_user.id)
+            session_id = token_hex(4)
+            state['lot_field_session'] = {
+                "id": session_id, "lot_id": lot_id, "schema": schema, "created_at": time.time(),
+                "chat_id": call.message.chat.id, "message_id": call.message.message_id,
+            }
+            lines = [f"🧩 <b>Поля FunPay лота #{lot_id}</b>"]
+            keyboard = telebot.types.InlineKeyboardMarkup(row_width=1)
+            if schema:
+                for index, field in enumerate(schema):
+                    lines.append(f"\n<b>{html_text(field['label'])}:</b> {html_text(field['value_label'] or '—')}")
+                    keyboard.row(telebot.types.InlineKeyboardButton(
+                        f"✏️ {field['label']}: {field['value_label'] or '—'}"[:60],
+                        callback_data=f"{CB_LOT_FIELD}:{session_id}:{index}:0"
+                    ))
+            else:
+                lines.append("\nУ этого лота нет доступных полей с вариантами выбора.")
+            keyboard.row(telebot.types.InlineKeyboardButton("⬅️ Назад к лоту", callback_data=f"{CB_LOT_VIEW}:{lot_id}"))
+            bot.edit_message_text("".join(lines), call.message.chat.id, call.message.message_id,
+                                  parse_mode="HTML", reply_markup=keyboard)
+        except Exception:
+            logger.debug("TRACEBACK", exc_info=True)
+            try:
+                bot.send_message(call.message.chat.id, "❌ Не удалось загрузить поля FunPay.")
+            except Exception:
+                pass
+
+    @bot.callback_query_handler(func=lambda c: c.data == CB_CREATE_NEW)
+    def callback_create_new(call):
+        state = get_user_state(call.from_user.id)
+        session_id = token_hex(4)
+        state['create_lot_session'] = {
+            "id": session_id, "step": "category_query", "created_at": time.time(), "chat_id": call.message.chat.id
+        }
+        result = bot.send_message(
+            call.message.chat.id,
+            "➕ <b>Создание лота</b>\n\nОтправьте ID раздела или часть его названия.",
+            parse_mode="HTML", reply_markup=skb.CLEAR_STATE_BTN()
+        )
+        tg.set_state(call.message.chat.id, result.id, call.from_user.id, CBT_CREATE_VALUE)
+        bot.answer_callback_query(call.id)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{CB_CREATE_CATEGORY}:"))
+    def callback_create_category(call):
+        try:
+            _, session_id, index_raw = call.data.rsplit(":", 2)
+            index = int(index_raw)
+            state = get_user_state(call.from_user.id)
+            session = state.get('create_lot_session') or {}
+            candidates = session.get('candidates') or []
+            if (session.get('id') != session_id or session.get('chat_id') != call.message.chat.id or session.get('step') != 'category_choice' or
+                    time.time() - session.get('created_at', 0) > 600 or not 0 <= index < len(candidates)):
+                raise ValueError("stale create session")
+            subcategory_id = int(candidates[index]['id'])
+            bot.answer_callback_query(call.id, "⏳ Загружаю форму FunPay...")
+            _, fields, schema = load_new_lot_form(subcategory_id)
+            try:
+                add_configured_subcategory_ids([subcategory_id])
+            except Exception:
+                logger.warning("[LOTS] Не удалось автоматически добавить раздел в настройки поиска.", exc_info=True)
+            session.update({
+                "step": "selects", "subcategory_id": subcategory_id, "fields": fields,
+                "schema": schema, "select_index": 0, "created_at": time.time(),
+            })
+            show_create_select(call.message.chat.id, call.message.message_id, call.from_user.id)
+        except Exception as exc:
+            logger.debug("TRACEBACK", exc_info=True)
+            bot.send_message(call.message.chat.id, f"❌ Не удалось открыть форму создания: {html_text(exc)}", parse_mode="HTML")
+
+    def show_create_select(chat_id: int, message_id: int, user_id: int):
+        session = get_user_state(user_id).get('create_lot_session') or {}
+        schema = session.get('schema') or []
+        index = int(session.get('select_index', 0))
+        if index >= len(schema):
+            session['step'] = 'title_ru'
+            result = bot.send_message(chat_id, f"✏️ Отправьте русское название ({LIMITS['title_min']}–{LIMITS['title_max']} символов).",
+                                      reply_markup=skb.CLEAR_STATE_BTN())
+            tg.set_state(chat_id, result.id, user_id, CBT_CREATE_VALUE)
+            return
+        field = schema[index]
+        keyboard = telebot.types.InlineKeyboardMarkup(row_width=1)
+        for option_index, option in enumerate(field['options']):
+            keyboard.row(telebot.types.InlineKeyboardButton(
+                option['label'][:60] or '—', callback_data=f"{CB_CREATE_OPTION}:{index}:{option_index}"
+            ))
+        keyboard.row(telebot.types.InlineKeyboardButton("❌ Отменить", callback_data=CB_CREATE_CANCEL))
+        bot.edit_message_text(
+            f"➕ <b>Создание лота</b>\n\nПоле {index + 1}/{len(schema)}: <b>{html_text(field['label'])}</b>",
+            chat_id, message_id, parse_mode="HTML", reply_markup=keyboard
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{CB_CREATE_OPTION}:"))
+    def callback_create_option(call):
+        try:
+            _, field_index_raw, option_index_raw = call.data.rsplit(":", 2)
+            field_index, option_index = int(field_index_raw), int(option_index_raw)
+            session = get_user_state(call.from_user.id).get('create_lot_session') or {}
+            schema = session.get('schema') or []
+            if session.get('step') != 'selects' or field_index != session.get('select_index') or not 0 <= field_index < len(schema):
+                raise ValueError("stale create option")
+            field = schema[field_index]
+            if not 0 <= option_index < len(field['options']):
+                raise ValueError("invalid create option")
+            session['fields'][field['name']] = field['options'][option_index]['value']
+            session['select_index'] = field_index + 1
+            bot.answer_callback_query(call.id)
+            show_create_select(call.message.chat.id, call.message.message_id, call.from_user.id)
+        except Exception:
+            logger.debug("TRACEBACK", exc_info=True)
+            bot.answer_callback_query(call.id, "❌ Шаг устарел. Начните создание заново.")
+
+    @bot.callback_query_handler(func=lambda c: c.data == CB_CREATE_CANCEL)
+    def callback_create_cancel(call):
+        get_user_state(call.from_user.id).pop('create_lot_session', None)
+        tg.clear_state(call.message.chat.id, call.from_user.id, True)
+        bot.answer_callback_query(call.id, "Создание отменено")
+        bot.edit_message_text("❌ Создание лота отменено.", call.message.chat.id, call.message.message_id)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{CB_LOT_FIELD}:"))
+    def callback_lot_field(call):
+        try:
+            _, session_id, index_raw, page_raw = call.data.rsplit(":", 3)
+            index, page = int(index_raw), int(page_raw)
+            session = get_user_state(call.from_user.id).get('lot_field_session') or {}
+            schema = session.get('schema') or []
+            if (session.get('id') != session_id or session.get('chat_id') != call.message.chat.id or
+                    session.get('message_id') != call.message.message_id or
+                    time.time() - session.get('created_at', 0) > 600 or not 0 <= index < len(schema)):
+                raise ValueError("stale field session")
+            field = schema[index]
+            keyboard = telebot.types.InlineKeyboardMarkup(row_width=1)
+            page_size = 20
+            max_page = max((len(field['options']) - 1) // page_size, 0)
+            page = max(0, min(page, max_page))
+            start = page * page_size
+            for option_index, option in enumerate(field['options'][start:start + page_size], start=start):
+                mark = "✓ " if option['value'] == field['value'] else ""
+                keyboard.row(telebot.types.InlineKeyboardButton(
+                    f"{mark}{option['label'] or '—'}"[:60],
+                    callback_data=f"{CB_LOT_FIELD_VALUE}:{session_id}:{index}:{option_index}"
+                ))
+            if max_page:
+                keyboard.row(*[
+                    telebot.types.InlineKeyboardButton("‹", callback_data=f"{CB_LOT_FIELD}:{session_id}:{index}:{page - 1}"),
+                    telebot.types.InlineKeyboardButton(f"{page + 1}/{max_page + 1}", callback_data="noop"),
+                    telebot.types.InlineKeyboardButton("›", callback_data=f"{CB_LOT_FIELD}:{session_id}:{index}:{page + 1}"),
+                ])
+            keyboard.row(telebot.types.InlineKeyboardButton(
+                "⬅️ К полям", callback_data=f"{CB_LOT_FIELDS}:{session['lot_id']}"
+            ))
+            bot.edit_message_text(
+                f"🧩 <b>{html_text(field['label'])}</b>\n\nВыберите доступное значение:",
+                call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=keyboard
+            )
+            bot.answer_callback_query(call.id)
+        except Exception:
+            logger.debug("TRACEBACK", exc_info=True)
+            bot.answer_callback_query(call.id, "❌ Список устарел. Откройте поля заново.")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{CB_LOT_FIELD_VALUE}:"))
+    def callback_lot_field_value(call):
+        if is_user_busy(call.from_user.id):
+            bot.answer_callback_query(call.id, "❌ Операция уже выполняется")
+            return
+        set_user_busy(call.from_user.id)
+        try:
+            bot.answer_callback_query(call.id, "⏳ Сохраняю...")
+            _, session_id, field_index_raw, option_index_raw = call.data.rsplit(":", 3)
+            field_index, option_index = int(field_index_raw), int(option_index_raw)
+            state = get_user_state(call.from_user.id)
+            session = state.get('lot_field_session') or {}
+            if (session.get('id') != session_id or session.get('chat_id') != call.message.chat.id or
+                    session.get('message_id') != call.message.message_id):
+                raise ValueError("wrong field session")
+            lot_id = int(session['lot_id'])
+            old_schema = session.get('schema') or []
+            if time.time() - session.get('created_at', 0) > 600 or not 0 <= field_index < len(old_schema):
+                raise ValueError("stale field session")
+            old_field = old_schema[field_index]
+            if not 0 <= option_index < len(old_field['options']):
+                raise ValueError("invalid option")
+            requested_value = old_field['options'][option_index]['value']
+
+            fresh_schema = get_lot_select_schema(lot_id)
+            fresh_field = next((item for item in fresh_schema if item['name'] == old_field['name']), None)
+            allowed = next((item for item in (fresh_field or {}).get('options', [])
+                            if item['value'] == requested_value), None)
+            if fresh_field is None or allowed is None:
+                raise ValueError("option is no longer available")
+            lot_fields = get_lot_fields_by_id(lot_id, call.message.chat.id)
+            lot_fields.edit_fields({fresh_field['name']: requested_value})
+            if not save_lot_changes(lot_fields, call.message.chat.id):
+                bot.send_message(call.message.chat.id, "❌ FunPay не сохранил значение.")
+                return
+            state.pop('lot_field_session', None)
+            call.data = f"{CB_LOT_FIELDS}:{lot_id}"
+            call._lots_manager_callback_answered = True
+            callback_lot_fields(call)
+        except Exception:
+            logger.debug("TRACEBACK", exc_info=True)
+            bot.send_message(call.message.chat.id, "❌ Значение недоступно или список устарел.")
+        finally:
+            clear_user_busy(call.from_user.id)
     
     @bot.callback_query_handler(func=lambda c: c.data.startswith("ml_edit_title_en:"))
     def callback_edit_title_en(call):
@@ -2355,7 +3383,7 @@ def init_commands(cardinal: Cardinal):
             result = bot.send_message(
                 call.message.chat.id,
                 f"✏️ <b>Изменение английского названия лота #{lot_id}</b>\n\n"
-                f"Текущее название (EN):\n<b>{current_title_en}</b>\n\n"
+                f"Текущее название (EN):\n<b>{html_text(current_title_en)}</b>\n\n"
                 f"📝 Отправьте новое английское название:\n"
                 f"• Минимум: {LIMITS['title_min']} символов\n"
                 f"• Максимум: {LIMITS['title_max']} символов\n\n"
@@ -2373,34 +3401,76 @@ def init_commands(cardinal: Cardinal):
             logger.debug("TRACEBACK", exc_info=True)
             bot.answer_callback_query(call.id, "❌ Ошибка")
 
-    @bot.callback_query_handler(func=lambda c: c.data.startswith(CB_LOT_EDIT_DESC))
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{CB_LOT_EDIT_DESC}:") and
+                                not c.data.startswith((f"{CB_LOT_EDIT_DESC_RU}:", f"{CB_LOT_EDIT_DESC_EN}:")))
     def callback_edit_desc(call):
         try:
             lot_id = int(call.data.split(":")[1])
             lot_fields = get_lot_fields_by_id(lot_id, call.message.chat.id)
-            current_desc = lot_fields.fields.get('fields[desc][ru]', lot_fields.fields.get('fields[desc][en]', 'Без описания'))
-            if len(current_desc) > 300:
-                current_desc = current_desc[:300] + "..."
+            current_ru = str(lot_fields.fields.get('fields[desc][ru]') or '—')
+            current_en = str(lot_fields.fields.get('fields[desc][en]') or '—')
+            if len(current_ru) > 250:
+                current_ru = current_ru[:250] + "…"
+            if len(current_en) > 250:
+                current_en = current_en[:250] + "…"
             bot.answer_callback_query(call.id)
-            result = bot.send_message(
-                call.message.chat.id,
-                f"📝 <b>Изменение описания лота #{lot_id}</b>\n\n"
-                f"Текущее описание:\n{current_desc}\n\n"
-                f"📝 Отправьте новое описание:\n"
-                f"• Максимум: {LIMITS['desc_max']} символов\n\n"
-                f"Или нажмите кнопку для отмены:",
-                parse_mode="HTML",
-                reply_markup=telebot.types.InlineKeyboardMarkup().add(
-                    telebot.types.InlineKeyboardButton("⬅️ Назад к лоту", callback_data=f"{CB_LOT_VIEW}:{lot_id}")
-                )
+            keyboard = telebot.types.InlineKeyboardMarkup(row_width=2)
+            keyboard.row(
+                telebot.types.InlineKeyboardButton("🇷🇺 Русское", callback_data=f"{CB_LOT_EDIT_DESC_RU}:{lot_id}"),
+                telebot.types.InlineKeyboardButton("🇬🇧 English", callback_data=f"{CB_LOT_EDIT_DESC_EN}:{lot_id}")
             )
-            if call.from_user.id not in user_data:
-                user_data[call.from_user.id] = {}
-            user_data[call.from_user.id]['editing_lot_id'] = lot_id
-            tg.set_state(call.message.chat.id, result.id, call.from_user.id, CBT_EDIT_LOT_DESC)
+            keyboard.row(telebot.types.InlineKeyboardButton("⬅️ Назад к лоту", callback_data=f"{CB_LOT_VIEW}:{lot_id}"))
+            bot.send_message(
+                call.message.chat.id,
+                f"📝 <b>Описания лота #{lot_id}</b>\n\n"
+                f"🇷🇺 <b>Русское:</b>\n{html_text(current_ru)}\n\n"
+                f"🇬🇧 <b>English:</b>\n{html_text(current_en)}\n\n"
+                "Выберите язык для изменения:",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
         except:
             logger.debug("TRACEBACK", exc_info=True)
             bot.answer_callback_query(call.id, "❌ Ошибка")
+
+    def start_edit_desc(call, language: str):
+        lot_id = int(call.data.rsplit(":", 1)[1])
+        lot_fields = get_lot_fields_by_id(lot_id, call.message.chat.id)
+        field_key = f"fields[desc][{language}]"
+        current_desc = str(lot_fields.fields.get(field_key) or '—')
+        if len(current_desc) > 300:
+            current_desc = current_desc[:300] + "…"
+        language_label = "🇷🇺 русского" if language == "ru" else "🇬🇧 английского"
+        bot.answer_callback_query(call.id)
+        result = bot.send_message(
+            call.message.chat.id,
+            f"📝 <b>Изменение {language_label} описания лота #{lot_id}</b>\n\n"
+            f"Текущее описание:\n{html_text(current_desc)}\n\n"
+            f"Отправьте новое описание (до {LIMITS['desc_max']} символов):",
+            parse_mode="HTML", reply_markup=skb.CLEAR_STATE_BTN()
+        )
+        state = get_user_state(call.from_user.id)
+        state['editing_lot_id'] = lot_id
+        state['editing_desc_language'] = language
+        state['editing_desc_chat_id'] = call.message.chat.id
+        tg.set_state(call.message.chat.id, result.id, call.from_user.id,
+                     CBT_EDIT_LOT_DESC if language == "ru" else CBT_EDIT_LOT_DESC_EN)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{CB_LOT_EDIT_DESC_RU}:"))
+    def callback_edit_desc_ru(call):
+        try:
+            start_edit_desc(call, "ru")
+        except Exception:
+            logger.debug("TRACEBACK", exc_info=True)
+            bot.answer_callback_query(call.id, "❌ Ошибка")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{CB_LOT_EDIT_DESC_EN}:"))
+    def callback_edit_desc_en(call):
+        try:
+            start_edit_desc(call, "en")
+        except Exception:
+            logger.debug("TRACEBACK", exc_info=True)
+            bot.answer_callback_query(call.id, "❌ Error")
 
     @bot.callback_query_handler(func=lambda c: c.data == CB_BACK_TO_LIST)
     def callback_back_to_list(call):
@@ -2413,7 +3483,7 @@ def init_commands(cardinal: Cardinal):
             page = user_data[user_id].get('page', 0)
             keyboard = create_lots_keyboard(lots, page, selection_mode=is_selection_mode(user_id), selected_ids=get_selected_lot_ids(user_id))
             bot.edit_message_text(
-                render_manage_lots_text(lots),
+                render_manage_lots_text(lots, state=user_data[user_id]),
                 call.message.chat.id,
                 call.message.message_id,
                 reply_markup=keyboard,
@@ -2679,12 +3749,17 @@ def init_commands(cardinal: Cardinal):
     @bot.callback_query_handler(func=lambda c: c.data == CB_SUBCAT_ADD)
     def callback_subcategory_add(call):
         try:
+            state = get_user_state(call.from_user.id)
+            session_id = token_hex(4)
+            state['subcategory_add_session'] = {
+                "id": session_id, "step": "query", "chat_id": call.message.chat.id, "created_at": time.time()
+            }
             bot.answer_callback_query(call.id)
             result = bot.send_message(
                 call.message.chat.id,
-                "📝 Отправьте ID подкатегории числом.\n"
-                "Можно один или несколько через запятую.\n\n"
-                "Пример: <code>12345, 67890</code>",
+                "🔎 Отправьте часть названия раздела или его ID.\n"
+                "Несколько ID можно отправить через запятую.\n\n"
+                "Примеры: <code>Steam</code> или <code>12345, 67890</code>",
                 parse_mode="HTML",
                 reply_markup=skb.CLEAR_STATE_BTN()
             )
@@ -2692,6 +3767,31 @@ def init_commands(cardinal: Cardinal):
         except Exception:
             logger.debug("TRACEBACK", exc_info=True)
             bot.answer_callback_query(call.id, "❌ Ошибка")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{CB_SUBCAT_PICK}:"))
+    def callback_subcategory_pick(call):
+        try:
+            _, session_id, index_raw = call.data.rsplit(":", 2)
+            index = int(index_raw)
+            state = get_user_state(call.from_user.id)
+            session = state.get('subcategory_add_session') or {}
+            candidates = session.get('candidates') or []
+            if (session.get('id') != session_id or session.get('step') != 'choice' or
+                    session.get('chat_id') != call.message.chat.id or
+                    time.time() - session.get('created_at', 0) > 600 or not 0 <= index < len(candidates)):
+                raise ValueError("stale subcategory search")
+            candidate = candidates[index]
+            subcategory_id = int(candidate['id'])
+            added = add_configured_subcategory_ids([subcategory_id])
+            state.pop('subcategory_add_session', None)
+            bot.edit_message_text(
+                render_subcategory_settings_text(), call.message.chat.id, call.message.message_id,
+                parse_mode="HTML", reply_markup=create_subcategory_settings_keyboard()
+            )
+            bot.answer_callback_query(call.id, "✅ Раздел добавлен" if added else "ℹ️ Раздел уже был добавлен")
+        except Exception:
+            logger.debug("TRACEBACK", exc_info=True)
+            bot.answer_callback_query(call.id, "❌ Результаты поиска устарели")
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{CB_SUBCAT_REMOVE}:"))
     def callback_subcategory_remove(call):
@@ -3218,6 +4318,180 @@ def init_commands(cardinal: Cardinal):
             logger.debug("TRACEBACK", exc_info=True)
             bot.answer_callback_query(call.id, "❌ Ошибка экспорта")
 
+    def handle_filter_value(m: telebot.types.Message):
+        state = get_user_state(m.from_user.id)
+        pending = state.get('pending_filter_input')
+        if not pending:
+            tg.clear_state(m.chat.id, m.from_user.id, True)
+            bot.send_message(m.chat.id, "❌ Настройка фильтра устарела. Откройте /manage_lots заново.")
+            return
+
+        raw_value = (m.text or "").strip()
+        filters = state.setdefault('lot_filters', dict(DEFAULT_LOT_FILTERS))
+        kind = pending.get('kind')
+        boundary = pending.get('boundary')
+
+        if kind == "title":
+            value = None if raw_value.casefold() in {"-", "—", "нет", "clear"} else raw_value
+            if value is not None and len(value) > LIMITS['title_max']:
+                bot.send_message(m.chat.id, f"❌ Поисковый запрос не должен превышать {LIMITS['title_max']} символов.")
+                return
+            filters['title_query'] = value or None
+            state.pop('pending_filter_input', None)
+            tg.clear_state(m.chat.id, m.from_user.id, True)
+            refresh_filtered_lots(m.from_user.id)
+            bot.send_message(
+                m.chat.id,
+                render_filter_menu_text(state),
+                parse_mode="HTML",
+                reply_markup=create_filter_keyboard(filters, len(state['lots']))
+            )
+            return
+
+        if kind not in {"price", "length"} or boundary not in {"min", "max"}:
+            state.pop('pending_filter_input', None)
+            tg.clear_state(m.chat.id, m.from_user.id, True)
+            bot.send_message(m.chat.id, "❌ Настройка фильтра устарела. Откройте меню фильтров заново.")
+            return
+        key = f"{'price' if kind == 'price' else 'title_len'}_{boundary}"
+
+        if raw_value in {"-", "—", "нет", "clear"}:
+            value = None
+        elif kind == "price":
+            valid, error, value = validate_price_value(raw_value)
+            if not valid:
+                bot.send_message(m.chat.id, error + "\nПовторите ввод или отправьте <code>-</code> для сброса.", parse_mode="HTML")
+                return
+        else:
+            try:
+                value = int(raw_value)
+            except (TypeError, ValueError):
+                bot.send_message(m.chat.id, f"❌ Введите целое число от 0 до {LIMITS['title_max']}.")
+                return
+            if not 0 <= value <= LIMITS['title_max']:
+                bot.send_message(m.chat.id, f"❌ Введите число от 0 до {LIMITS['title_max']}.")
+                return
+
+        candidate = dict(filters)
+        candidate[key] = value
+        minimum = candidate.get('price_min' if kind == 'price' else 'title_len_min')
+        maximum = candidate.get('price_max' if kind == 'price' else 'title_len_max')
+        if minimum is not None and maximum is not None and minimum > maximum:
+            bot.send_message(m.chat.id, "❌ Минимальное значение не может быть больше максимального. Повторите ввод.")
+            return
+
+        filters[key] = value
+        state.pop('pending_filter_input', None)
+        tg.clear_state(m.chat.id, m.from_user.id, True)
+        refresh_filtered_lots(m.from_user.id)
+        bot.send_message(
+            m.chat.id,
+            render_filter_menu_text(state),
+            parse_mode="HTML",
+            reply_markup=create_filter_keyboard(filters, len(state['lots']))
+        )
+
+    def handle_create_value(m: telebot.types.Message):
+        state = get_user_state(m.from_user.id)
+        session = state.get('create_lot_session') or {}
+        if session.get('chat_id') != m.chat.id or time.time() - session.get('created_at', 0) > 600:
+            state.pop('create_lot_session', None)
+            tg.clear_state(m.chat.id, m.from_user.id, True)
+            bot.send_message(m.chat.id, "❌ Сессия создания устарела. Начните заново.")
+            return
+        step = session.get('step')
+        raw = (m.text or "").strip()
+        if step == 'category_query':
+            candidates = search_common_subcategories(raw)
+            if not candidates:
+                bot.send_message(m.chat.id, "❌ Разделы не найдены. Отправьте другой запрос или точный ID.")
+                return
+            session['candidates'] = [{"id": item.id, "name": str(item.ui_name)} for item in candidates]
+            session['step'] = 'category_choice'
+            session['created_at'] = time.time()
+            keyboard = telebot.types.InlineKeyboardMarkup(row_width=1)
+            for index, item in enumerate(session['candidates']):
+                keyboard.row(telebot.types.InlineKeyboardButton(
+                    f"{item['name']} · ID {item['id']}"[:60],
+                    callback_data=f"{CB_CREATE_CATEGORY}:{session['id']}:{index}"
+                ))
+            keyboard.row(telebot.types.InlineKeyboardButton("❌ Отменить", callback_data=CB_CREATE_CANCEL))
+            tg.clear_state(m.chat.id, m.from_user.id, True)
+            bot.send_message(m.chat.id, "Выберите раздел:", reply_markup=keyboard)
+            return
+        if step == 'title_ru':
+            valid, error = validate_title(raw)
+            if not valid:
+                bot.send_message(m.chat.id, error)
+                return
+            session['fields']['fields[summary][ru]'] = raw
+            session['step'] = 'title_en'
+            session['created_at'] = time.time()
+            bot.send_message(m.chat.id, "🇬🇧 Отправьте английское название или <code>-</code>, чтобы использовать русское.", parse_mode="HTML")
+            return
+        if step == 'title_en':
+            value = session['fields'].get('fields[summary][ru]', '') if raw in {'-', '—'} else raw
+            valid, error = validate_title(value)
+            if not valid:
+                bot.send_message(m.chat.id, error)
+                return
+            session['fields']['fields[summary][en]'] = value
+            session['step'] = 'desc_ru'
+            session['created_at'] = time.time()
+            bot.send_message(m.chat.id, "📝 Отправьте русское описание.")
+            return
+        if step == 'desc_ru':
+            valid, error = validate_desc(raw)
+            if not valid:
+                bot.send_message(m.chat.id, error)
+                return
+            session['fields']['fields[desc][ru]'] = raw
+            session['step'] = 'desc_en'
+            session['created_at'] = time.time()
+            bot.send_message(m.chat.id, "🇬🇧 Отправьте английское описание или <code>-</code>, чтобы использовать русское.", parse_mode="HTML")
+            return
+        if step == 'desc_en':
+            value = session['fields'].get('fields[desc][ru]', '') if raw in {'-', '—'} else raw
+            valid, error = validate_desc(value)
+            if not valid:
+                bot.send_message(m.chat.id, error)
+                return
+            session['fields']['fields[desc][en]'] = value
+            session['step'] = 'price'
+            session['created_at'] = time.time()
+            bot.send_message(m.chat.id, f"💰 Отправьте цену ({LIMITS['price_min']:g}–{LIMITS['price_max']:g}).")
+            return
+        if step == 'price':
+            if is_user_busy(m.from_user.id):
+                bot.send_message(m.chat.id, "❌ Операция уже выполняется.")
+                return
+            valid, error, price = validate_price_value(raw)
+            if not valid:
+                bot.send_message(m.chat.id, error)
+                return
+            session['fields']['price'] = str(price)
+            session['fields'].pop('active', None)
+            session['step'] = 'saving'
+            set_user_busy(m.from_user.id)
+            try:
+                lot = FunPayAPI.types.LotFields(0, dict(session['fields']))
+                create_lot(cardinal.account, lot)
+                state.pop('create_lot_session', None)
+                tg.clear_state(m.chat.id, m.from_user.id, True)
+                bot.send_message(m.chat.id, "✅ Лот создан и оставлен неактивным. Обновите список лотов.")
+            except FunPayAPI.exceptions.LotSavingError as exc:
+                logger.debug("TRACEBACK", exc_info=True)
+                bot.send_message(m.chat.id, f"❌ FunPay отклонил форму: {html_text(exc)}", parse_mode="HTML")
+            except Exception:
+                logger.debug("TRACEBACK", exc_info=True)
+                bot.send_message(m.chat.id, "❌ Не удалось создать лот. Проверьте логи Cardinal.")
+            finally:
+                if state.get('create_lot_session') is session and session.get('step') == 'saving':
+                    session['step'] = 'price'
+                clear_user_busy(m.from_user.id)
+            return
+        bot.send_message(m.chat.id, "❌ Неизвестный шаг создания. Начните заново.")
+
     def handle_edit_price(m: telebot.types.Message):
         if m.from_user.id not in user_data or 'editing_lot_id' not in user_data[m.from_user.id]:
             bot.send_message(m.chat.id, "❌ Ошибка: данные лота не найдены.")
@@ -3347,32 +4621,42 @@ def init_commands(cardinal: Cardinal):
             bot.send_message(m.chat.id, "❌ Ошибка: данные лота не найдены.")
             return
         lot_id = user_data[m.from_user.id]['editing_lot_id']
+        language = user_data[m.from_user.id].get('editing_desc_language', 'ru')
+        if user_data[m.from_user.id].get('editing_desc_chat_id') != m.chat.id:
+            tg.clear_state(m.chat.id, m.from_user.id, True)
+            bot.send_message(m.chat.id, "❌ Сессия редактирования устарела. Откройте лот заново.")
+            return
         new_desc = m.text.strip()
         valid, error_msg = validate_desc(new_desc)
         if not valid:
             bot.send_message(m.chat.id, error_msg)
             return
-        tg.clear_state(m.chat.id, m.from_user.id, True)
         if is_user_busy(m.from_user.id):
             bot.send_message(m.chat.id, "❌ Операция уже выполняется")
             return
+        tg.clear_state(m.chat.id, m.from_user.id, True)
         set_user_busy(m.from_user.id)
         try:
-            bot.send_message(m.chat.id, f"⏳ Изменяю описание лота #{lot_id}...")
+            language_label = "русское" if language == "ru" else "английское"
+            bot.send_message(m.chat.id, f"⏳ Изменяю {language_label} описание лота #{lot_id}...")
             lot_fields = get_lot_fields_by_id(lot_id, m.chat.id)
-            lot_fields.description_ru = new_desc
-            lot_fields.description_en = new_desc
+            if language == "en":
+                lot_fields.description_en = new_desc
+            else:
+                lot_fields.description_ru = new_desc
 
             if save_lot_changes(lot_fields, m.chat.id):
                 update_cached_lots_for_user(m.from_user.id, m.chat.id)
                 user_data[m.from_user.id].pop('editing_lot_id', None)
+                user_data[m.from_user.id].pop('editing_desc_language', None)
+                user_data[m.from_user.id].pop('editing_desc_chat_id', None)
                 keyboard = telebot.types.InlineKeyboardMarkup().add(
                     telebot.types.InlineKeyboardButton("🔄 Обновить список", callback_data=f"{CB_PAGE}:0")
                 )
                 desc_preview = new_desc[:200] + "..." if len(new_desc) > 200 else new_desc
                 bot.send_message(
                     m.chat.id,
-                    f"✅ Описание изменено!\n\nПревью:\n{html_text(desc_preview)}",
+                    f"✅ {language_label.capitalize()} описание изменено!\n\nПревью:\n{html_text(desc_preview)}",
                     parse_mode="HTML",
                     reply_markup=keyboard
                 )
@@ -3385,33 +4669,72 @@ def init_commands(cardinal: Cardinal):
             bot.send_message(m.chat.id, "❌ Произошла ошибка при изменении описания.")
 
     def handle_add_subcategory_id(m: telebot.types.Message):
-        tg.clear_state(m.chat.id, m.from_user.id, True)
-        parsed_ids, invalid_parts = parse_subcategory_ids_input(m.text)
-
-        if not parsed_ids:
-            bot.send_message(m.chat.id, "❌ Не найдено ни одного корректного ID. Отправьте числа, например: 12345, 67890")
+        state = get_user_state(m.from_user.id)
+        session = state.get('subcategory_add_session') or {}
+        if (session.get('step') != 'query' or session.get('chat_id') != m.chat.id or
+                time.time() - session.get('created_at', 0) > 600):
+            state.pop('subcategory_add_session', None)
+            tg.clear_state(m.chat.id, m.from_user.id, True)
+            bot.send_message(m.chat.id, "❌ Сессия поиска раздела устарела. Откройте меню заново.")
             return
 
-        added_ids = add_configured_subcategory_ids(parsed_ids)
-        duplicates = [lot_id for lot_id in parsed_ids if lot_id not in added_ids]
+        raw = (m.text or "").strip()
+        if not raw:
+            bot.send_message(m.chat.id, "❌ Отправьте название раздела или ID.")
+            return
+        parsed_ids, invalid_parts = parse_subcategory_ids_input(raw)
 
-        message = [f"✅ Добавлено ID: <code>{', '.join(str(i) for i in added_ids) if added_ids else '—'}</code>"]
-        if duplicates:
-            unique_duplicates = []
-            seen = set()
-            for lot_id in duplicates:
-                if lot_id in seen:
-                    continue
-                seen.add(lot_id)
-                unique_duplicates.append(lot_id)
-            message.append(f"ℹ️ Уже были в списке: <code>{', '.join(str(i) for i in unique_duplicates)}</code>")
-        if invalid_parts:
-            message.append(f"⚠️ Пропущены некорректные значения: <code>{', '.join(invalid_parts)}</code>")
+        if parsed_ids and invalid_parts:
+            bot.send_message(
+                m.chat.id,
+                "❌ Не смешивайте ID и название в одном запросе.\n"
+                "Отправьте либо несколько ID, либо одно название раздела."
+            )
+            return
 
-        keyboard = telebot.types.InlineKeyboardMarkup().add(
-            telebot.types.InlineKeyboardButton("🗂️ Открыть список ID", callback_data=CB_SUBCAT_MENU)
+        if not invalid_parts and parsed_ids:
+            tg.clear_state(m.chat.id, m.from_user.id, True)
+            state.pop('subcategory_add_session', None)
+            added_ids = add_configured_subcategory_ids(parsed_ids)
+            duplicates = [lot_id for lot_id in parsed_ids if lot_id not in added_ids]
+
+            message = [f"✅ Добавлено ID: <code>{', '.join(str(i) for i in added_ids) if added_ids else '—'}</code>"]
+            if duplicates:
+                unique_duplicates = list(dict.fromkeys(duplicates))
+                message.append(f"ℹ️ Уже были в списке: <code>{', '.join(str(i) for i in unique_duplicates)}</code>")
+            keyboard = telebot.types.InlineKeyboardMarkup().add(
+                telebot.types.InlineKeyboardButton("🗂️ Открыть список разделов", callback_data=CB_SUBCAT_MENU)
+            )
+            bot.send_message(m.chat.id, "\n".join(message), parse_mode="HTML", reply_markup=keyboard)
+            return
+
+        try:
+            candidates = search_common_subcategories(raw)
+        except Exception:
+            logger.debug("TRACEBACK", exc_info=True)
+            bot.send_message(m.chat.id, "❌ Не удалось получить список разделов FunPay.")
+            return
+        if not candidates:
+            bot.send_message(m.chat.id, "❌ Разделы не найдены. Уточните название или отправьте точный ID.")
+            return
+
+        session['step'] = 'choice'
+        session['created_at'] = time.time()
+        session['candidates'] = [{"id": item.id, "name": str(item.ui_name)} for item in candidates]
+        tg.clear_state(m.chat.id, m.from_user.id, True)
+        keyboard = telebot.types.InlineKeyboardMarkup(row_width=1)
+        for index, candidate in enumerate(session['candidates']):
+            keyboard.row(telebot.types.InlineKeyboardButton(
+                f"{candidate['name']} · ID {candidate['id']}"[:60],
+                callback_data=f"{CB_SUBCAT_PICK}:{session['id']}:{index}"
+            ))
+        keyboard.row(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=CB_SUBCAT_MENU))
+        bot.send_message(
+            m.chat.id,
+            "Выберите нужный раздел. Если его нет, вернитесь и уточните запрос:",
+            reply_markup=keyboard
         )
-        bot.send_message(m.chat.id, "\n".join(message), parse_mode="HTML", reply_markup=keyboard)
+        return
 
     def view_disabled_lots(m: telebot.types.Message):
         """Показывает список отключенных лотов."""
@@ -3667,6 +4990,80 @@ def init_commands(cardinal: Cardinal):
             logger.exception("TRACEBACK:")
             bot.send_message(m.chat.id, f"❌ Произошла ошибка: {str(e)}")
 
+    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{UPDATER_CB_CONSENT}:"))
+    def callback_updater_consent(call):
+        answer = call.data.rsplit(":", 1)[1]
+        updater_settings["consent"] = "accepted" if answer == "yes" else "declined"
+        updater_settings["enabled"] = answer == "yes"
+        updater_settings["consent_fingerprint"] = UPDATER_CONSENT_FINGERPRINT
+        save_updater_settings()
+        bot.answer_callback_query(call.id, "Настройка сохранена")
+        bot.edit_message_text(
+            "✅ Автообновления включены. Повторите нужную команду."
+            if answer == "yes" else
+            "🚫 Автообновления выключены. Повторите нужную команду; плагин продолжит работать без сетевых проверок.",
+            call.message.chat.id, call.message.message_id
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data == UPDATER_CB_TOGGLE)
+    def callback_updater_toggle(call):
+        enabled = not updater_settings.get("enabled", False)
+        updater_settings["consent"] = "accepted" if enabled else "declined"
+        updater_settings["enabled"] = enabled
+        updater_settings["consent_fingerprint"] = UPDATER_CONSENT_FINGERPRINT
+        save_updater_settings()
+        bot.answer_callback_query(call.id, "✅ Автообновления включены" if enabled else "🚫 Автообновления выключены")
+        bot.edit_message_text(
+            render_manage_menu_text("settings"), call.message.chat.id, call.message.message_id,
+            parse_mode="HTML", reply_markup=create_manage_menu_keyboard("settings")
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data == UPDATER_CB_CHECK)
+    def callback_updater_check(call):
+        if updater_settings.get("consent") != "accepted":
+            bot.answer_callback_query(call.id, "Сначала включите автообновления")
+            return
+        bot.answer_callback_query(call.id, "⏳ Проверяю GitHub...")
+        status = bot.send_message(call.message.chat.id, "⏳ Проверяю обновления LotsManager...")
+        def worker():
+            try:
+                result = check_and_install_update()
+                text = updater_result_text(result)
+            except Exception as exc:
+                logger.error("[LOTS UPDATER] Ручная проверка не удалась: %s", exc, exc_info=True)
+                text = "❌ Обновление не установлено. Проверьте подключение и логи Cardinal."
+            try:
+                bot.edit_message_text(text, call.message.chat.id, status.id, parse_mode="HTML")
+            except Exception:
+                logger.debug("[LOTS UPDATER] Не удалось обновить статусное сообщение.", exc_info=True)
+        threading.Thread(target=worker, name="LotsManagerManualUpdater", daemon=True).start()
+
+    def lots_update_command(m: Message):
+        if updater_settings.get("consent") == "unknown":
+            ask_updater_consent(m.chat.id)
+            return
+        keyboard = telebot.types.InlineKeyboardMarkup(row_width=2)
+        keyboard.row(
+            telebot.types.InlineKeyboardButton(
+                "🚫 Выключить" if updater_settings.get("enabled") else "✅ Включить",
+                callback_data=UPDATER_CB_TOGGLE
+            ),
+            telebot.types.InlineKeyboardButton("⬇️ Проверить сейчас", callback_data=UPDATER_CB_CHECK)
+        )
+        bot.send_message(
+            m.chat.id,
+            f"🔄 <b>Обновления LotsManager</b>\n\nВерсия: <b>{html_text(VERSION)}</b>\n"
+            f"Статус: {'🟢 включены' if updater_settings.get('enabled') else '🔴 выключены'}",
+            parse_mode="HTML", reply_markup=keyboard
+        )
+
+    def gate_handler(handler):
+        def wrapped(message, *args, **kwargs):
+            if not gate_first_use(message):
+                return None
+            return handler(message, *args, **kwargs)
+        return wrapped
+
     # ========== СТАРЫЕ ДВУХШАГОВЫЕ ОБРАБОТЧИКИ ОТКЛЮЧЕНЫ ==========
 
     # ========== РЕГИСТРАЦИЯ КОМАНД ==========
@@ -3685,28 +5082,33 @@ def init_commands(cardinal: Cardinal):
         ("clear_disabled_history", "очистить историю отключенных лотов", True),
         ("lots_tags", "создать/обновить теги для всех лотов", True),
         ("tags_help", "справка по использованию тегов", True),
-        ("edit_lot_tag", "изменить тег конкретного лота", True)
+        ("edit_lot_tag", "изменить тег конкретного лота", True),
+        ("lots_update", "настройки и проверка обновлений LotsManager", True)
     ])
 
-    tg.msg_handler(act_copy_lots, commands=["copy_lots"])
+    tg.msg_handler(gate_handler(act_copy_lots), commands=["copy_lots"])
     tg.msg_handler(copy_lots, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_COPY_LOTS))
-    tg.msg_handler(act_cache_lots, commands=["cache_lots"])
-    tg.msg_handler(act_create_lots, commands=["create_lots"])
-    tg.msg_handler(copy_with_secrets, commands=["copy_with_secrets"])
-    tg.msg_handler(manage_menu, commands=["manage_menu"])
-    tg.msg_handler(manage_lots, commands=["manage_lots"])
-    tg.msg_handler(show_lot_subcats, commands=["lot_subcats"])
-    tg.msg_handler(add_lot_subcat, commands=["add_lot_subcat"])
-    tg.msg_handler(remove_lot_subcat, commands=["remove_lot_subcat"])
-    tg.msg_handler(view_disabled_lots, commands=["disabled_lots"])
-    tg.msg_handler(clear_disabled_lots_history, commands=["clear_disabled_history"])
-    tg.msg_handler(manage_lot_tags, commands=["lots_tags"])
-    tg.msg_handler(show_lot_tags_help, commands=["tags_help"])
-    tg.msg_handler(edit_lot_tag, commands=["edit_lot_tag"])
+    tg.msg_handler(gate_handler(act_cache_lots), commands=["cache_lots"])
+    tg.msg_handler(gate_handler(act_create_lots), commands=["create_lots"])
+    tg.msg_handler(gate_handler(copy_with_secrets), commands=["copy_with_secrets"])
+    tg.msg_handler(gate_handler(manage_menu), commands=["manage_menu"])
+    tg.msg_handler(gate_handler(manage_lots), commands=["manage_lots"])
+    tg.msg_handler(gate_handler(show_lot_subcats), commands=["lot_subcats"])
+    tg.msg_handler(gate_handler(add_lot_subcat), commands=["add_lot_subcat"])
+    tg.msg_handler(gate_handler(remove_lot_subcat), commands=["remove_lot_subcat"])
+    tg.msg_handler(gate_handler(view_disabled_lots), commands=["disabled_lots"])
+    tg.msg_handler(gate_handler(clear_disabled_lots_history), commands=["clear_disabled_history"])
+    tg.msg_handler(gate_handler(manage_lot_tags), commands=["lots_tags"])
+    tg.msg_handler(gate_handler(show_lot_tags_help), commands=["tags_help"])
+    tg.msg_handler(gate_handler(edit_lot_tag), commands=["edit_lot_tag"])
+    tg.msg_handler(lots_update_command, commands=["lots_update"])
+    tg.msg_handler(handle_filter_value, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_FILTER_VALUE))
+    tg.msg_handler(handle_create_value, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_CREATE_VALUE))
     tg.msg_handler(handle_edit_price, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_EDIT_LOT_PRICE))
     tg.msg_handler(handle_edit_title_ru, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_EDIT_LOT_TITLE_RU))
     tg.msg_handler(handle_edit_title_en, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_EDIT_LOT_TITLE_EN))
     tg.msg_handler(handle_edit_desc, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_EDIT_LOT_DESC))
+    tg.msg_handler(handle_edit_desc, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_EDIT_LOT_DESC_EN))
     tg.msg_handler(handle_add_subcategory_id, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_ADD_SUBCATEGORY_ID))
     tg.file_handler(CBT_CREATE_LOTS, create_lots)
     
