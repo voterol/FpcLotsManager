@@ -40,7 +40,7 @@ except ImportError:  # Windows Cardinal installations use the in-process fallbac
 
 
 NAME = "LotsManager"
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 DESCRIPTION = "Плагин для копирования и управления лотами через inline кнопки."
 CREDITS = "@woopertail, @sidor0912, @voterol (gpt5.6-sol)"
 UUID = "5693f220-bcc6-4f6e-9745-9dee8664cbb2"
