@@ -180,6 +180,8 @@ activation_timers = set()
 activation_lifecycle_lock = threading.RLock()
 activation_shutdown = threading.Event()
 updater_file_fallback_lock = threading.RLock()
+updater_live_log_lock = threading.RLock()
+updater_live_log_runtime = None
 
 
 def default_updater_settings() -> dict:
@@ -201,6 +203,43 @@ def default_updater_settings() -> dict:
         "pending_activation": None,
         "completed_activations": [],
     }
+
+
+UPDATER_STAGE_LABELS = {
+    "waiting": "Ожидание следующей проверки",
+    "check_started": "Подключение к GitHub",
+    "version_received": "Версия на GitHub получена",
+    "already_current": "Установлена актуальная версия",
+    "candidate_resolving": "Проверка immutable commit",
+    "candidate_ready": "Обновление найдено, ожидается решение",
+    "install_started": "Установка обновления началась",
+    "version_verified": "VERSION проверен",
+    "source_downloaded": "Файл плагина загружен",
+    "source_validated": "Код и metadata проверены",
+    "backup_created": "Резервная копия создана",
+    "replacement_written": "Файл плагина заменён",
+    "install_persisted": "Установка сохранена, готовится restart",
+    "install_failed": "Установка не удалась",
+    "restart_claimed": "Попытка restart зарегистрирована",
+    "restart_requested": "Cardinal перезапускается",
+    "restart_failed": "Restart не удался",
+    "check_failed": "Проверка обновлений не удалась",
+}
+
+
+def render_updater_live_status(stage: str, *, local_version: str, remote_version: str | None = None,
+                               attempt: int | None = None, sequence: int = 0) -> str:
+    """Render a bounded sanitized updater status; never accepts raw errors or paths."""
+    label = UPDATER_STAGE_LABELS.get(stage, "Обновление статуса")
+    lines = ["📡 <b>LotsManager live logs</b>", f"#{max(0, int(sequence))} · {html_text(label)}",
+             f"Локальная версия: <code>{html_text(local_version)}</code>"]
+    if remote_version:
+        lines.append(f"Версия GitHub: <code>{html_text(remote_version)}</code>")
+    if attempt is not None:
+        safe_attempt = min(UPDATER_MAX_ACTIVATION_RESTARTS, max(0, int(attempt)))
+        lines.append(f"Restart: <b>{safe_attempt}/{UPDATER_MAX_ACTIVATION_RESTARTS}</b>")
+    lines.append("Выключить: /lmlogs")
+    return "\n".join(lines)[:3500]
 
 
 updater_settings = default_updater_settings()
@@ -466,6 +505,12 @@ def claim_activation_restart(state: dict, running_version: str, now: int) -> boo
 def cancel_updater_timers(cardinal=None, call=None):
     """Cancel timers owned by this module generation before plugin removal/reload."""
     activation_shutdown.set()
+    with updater_live_log_lock:
+        runtime = updater_live_log_runtime
+        if runtime:
+            runtime["shutdown"].set()
+            runtime["subscribers"].clear()
+            runtime["condition"].notify_all()
     with activation_lifecycle_lock:
         for timer in tuple(activation_timers):
             try:
@@ -1139,6 +1184,95 @@ def init_commands(cardinal: Cardinal):
             return False
         return True
 
+    global updater_live_log_runtime
+    live_log_condition = threading.Condition(updater_live_log_lock)
+    live_log_runtime = {
+        "token": token_hex(8), "shutdown": threading.Event(), "condition": live_log_condition,
+        "subscribers": {}, "sequence": 0, "pending": None, "latest": None,
+    }
+    with updater_live_log_lock:
+        previous_runtime = updater_live_log_runtime
+        if previous_runtime:
+            previous_runtime["shutdown"].set()
+            previous_runtime["subscribers"].clear()
+            previous_runtime["condition"].notify_all()
+        updater_live_log_runtime = live_log_runtime
+
+    def live_log_worker():
+        while not live_log_runtime["shutdown"].is_set():
+            with live_log_condition:
+                if live_log_runtime["pending"] is None:
+                    live_log_condition.wait(timeout=1)
+                    continue
+                sequence, text = live_log_runtime["pending"]
+                live_log_runtime["pending"] = None
+                subscribers = list(live_log_runtime["subscribers"].items())
+            for user_id, subscription in subscribers:
+                with updater_live_log_lock:
+                    if (live_log_runtime["shutdown"].is_set()
+                            or live_log_runtime["subscribers"].get(user_id) is not subscription
+                            or sequence <= subscription.get("delivered", -1)):
+                        continue
+                if user_id not in authorized_user_ids():
+                    with updater_live_log_lock:
+                        live_log_runtime["subscribers"].pop(user_id, None)
+                    continue
+                try:
+                    bot.edit_message_text(text, subscription["chat_id"], subscription["message_id"],
+                                          parse_mode="HTML")
+                except Exception:
+                    logger.debug("[LOTS UPDATER] /lmlogs edit не удался; следующее событие повторит попытку.",
+                                 exc_info=True)
+                    continue
+                with updater_live_log_lock:
+                    if live_log_runtime["subscribers"].get(user_id) is subscription:
+                        subscription["delivered"] = sequence
+
+    threading.Thread(target=live_log_worker, name="LotsManagerLiveLogs", daemon=True).start()
+
+    def emit_updater_stage(stage: str, *, remote_version: str | None = None,
+                           attempt: int | None = None) -> None:
+        """Best-effort sanitized status edits; Telegram failures never affect the updater."""
+        if live_log_runtime["shutdown"].is_set():
+            return
+        with updater_live_log_lock:
+            live_log_runtime["sequence"] += 1
+            sequence = live_log_runtime["sequence"]
+            live_log_runtime["pending"] = (sequence, render_updater_live_status(
+                stage, local_version=VERSION, remote_version=remote_version,
+                attempt=attempt, sequence=sequence))
+            live_log_runtime["latest"] = live_log_runtime["pending"]
+            live_log_condition.notify()
+
+    def lmlogs_command(message):
+        user_id = getattr(getattr(message, "from_user", None), "id", None)
+        if user_id not in authorized_user_ids():
+            return
+        with updater_live_log_lock:
+            existing = live_log_runtime["subscribers"].pop(user_id, None)
+            if existing:
+                existing["active"] = False
+        if existing:
+            try:
+                bot.send_message(user_id, "🔕 Live logs LotsManager выключены.")
+            except Exception:
+                logger.debug("[LOTS UPDATER] Не удалось подтвердить отключение /lmlogs.", exc_info=True)
+            return
+        with updater_live_log_lock:
+            initial_sequence = live_log_runtime["sequence"]
+            latest = live_log_runtime["latest"]
+        text = (latest[1] if latest else render_updater_live_status(
+            "waiting", local_version=VERSION, sequence=initial_sequence))
+        status = bot.send_message(user_id, text, parse_mode="HTML")
+        with updater_live_log_lock:
+            subscription = {"chat_id": user_id, "message_id": status.id,
+                            "delivered": initial_sequence, "active": True}
+            live_log_runtime["subscribers"][user_id] = subscription
+            latest = live_log_runtime["latest"]
+            if latest and latest[0] > initial_sequence:
+                live_log_runtime["pending"] = latest
+                live_log_condition.notify()
+
     def startup_keyboard(enabled: bool):
         keyboard = telebot.types.InlineKeyboardMarkup(row_width=2)
         keyboard.row(
@@ -1243,16 +1377,19 @@ def init_commands(cardinal: Cardinal):
         if not updater_lock.acquire(blocking=False):
             return {"status": "busy"}
         try:
+            emit_updater_stage("check_started")
             if auto_generation is not None and not auto_update_allowed(
                     updater_settings.get("enabled", False), auto_generation, updater_generation["value"]):
                 return {"status": "cancelled"}
             remote_version = parse_version_document(fetch_limited_source(UPDATER_VERSION_URL, 128))
+            emit_updater_stage("version_received", remote_version=remote_version)
             action = update_action(VERSION, remote_version)
             if action != "install":
                 updater_settings.update({
                     "last_checked_at": int(time.time()), "last_version": remote_version,
                 })
                 save_updater_settings()
+                emit_updater_stage("already_current", remote_version=remote_version)
                 return {"status": action, "version": remote_version}
             existing = normalize_update_candidate(updater_settings.get("candidate"), int(time.time()))
             # Still perform the required raw startup/hourly comparison, but A owns the decision slot.
@@ -1260,6 +1397,7 @@ def init_commands(cardinal: Cardinal):
                 updater_settings.update({"last_checked_at": int(time.time()), "last_version": remote_version})
                 save_updater_settings()
                 return {"status": "candidate", "candidate": existing}
+            emit_updater_stage("candidate_resolving", remote_version=remote_version)
             commit_sha = resolve_version_commit(remote_version)
             updater_settings.update({"last_checked_at": int(time.time()), "last_commit": commit_sha,
                                      "last_version": remote_version})
@@ -1273,6 +1411,7 @@ def init_commands(cardinal: Cardinal):
                          "recipients": list(authorized_user_ids()), "prompted": []}
             updater_settings["candidate"] = candidate
             save_updater_settings()
+            emit_updater_stage("candidate_ready", remote_version=remote_version)
             return {"status": "candidate", "candidate": candidate}
         finally:
             updater_lock.release()
@@ -1285,13 +1424,17 @@ def init_commands(cardinal: Cardinal):
             if candidate is None or candidate["token"] != expected_token or candidate["decision"] != "installing":
                 return {"status": "stale"}
             commit_sha, remote_version = candidate["commit"], candidate["version"]
+            emit_updater_stage("install_started", remote_version=remote_version)
             _, version_url, source_url = build_update_urls(commit_sha)
             if parse_version_document(fetch_limited_source(version_url, 128)) != remote_version:
                 raise RuntimeError("immutable VERSION не совпадает с candidate")
+            emit_updater_stage("version_verified", remote_version=remote_version)
             source = fetch_limited_source(source_url)
+            emit_updater_stage("source_downloaded", remote_version=remote_version)
             metadata = validate_update_source(source)
             if metadata["VERSION"] != remote_version:
                 raise RuntimeError("VERSION не совпадает с metadata LotsManager.py")
+            emit_updater_stage("source_validated", remote_version=remote_version)
 
             target = resolve_plugin_path()
             current_bytes = target.read_bytes()
@@ -1304,6 +1447,7 @@ def init_commands(cardinal: Cardinal):
                 shutil.copy2(target, backup)
                 if hashlib.sha256(backup.read_bytes()).hexdigest() != hashlib.sha256(current_bytes).hexdigest():
                     raise RuntimeError("резервная копия повреждена")
+                emit_updater_stage("backup_created", remote_version=remote_version)
                 source_bytes = source.encode("utf-8")
                 with NamedTemporaryFile("wb", dir=target.parent, prefix=f".{target.name}.",
                                        suffix=".update", delete=False) as temp:
@@ -1317,6 +1461,7 @@ def init_commands(cardinal: Cardinal):
                 replace(str(temp_path), str(target))
                 temp_path = None
                 validate_update_source(target.read_text(encoding="utf-8"))
+                emit_updater_stage("replacement_written", remote_version=remote_version)
                 updater_settings.update({
                     "last_checked_at": int(time.time()), "last_commit": commit_sha,
                     "last_version": remote_version,
@@ -1328,6 +1473,7 @@ def init_commands(cardinal: Cardinal):
                                            "restart_attempts": 0, "next_retry_at": int(time.time())},
                 })
                 save_updater_settings()
+                emit_updater_stage("install_persisted", remote_version=remote_version)
             except Exception:
                 updater_settings.clear()
                 updater_settings.update(previous_settings)
@@ -1418,12 +1564,18 @@ def init_commands(cardinal: Cardinal):
             with updater_lock:
                 updater_settings.clear()
                 updater_settings.update(durable)
+            emit_updater_stage("restart_claimed", remote_version=pending["to_version"],
+                               attempt=pending["restart_attempts"])
             with activation_lifecycle_lock:
                 if activation_shutdown.is_set():
                     return
             try:
+                emit_updater_stage("restart_requested", remote_version=pending["to_version"],
+                                   attempt=pending["restart_attempts"])
                 cardinal_tools.restart_program()
             except Exception:
+                emit_updater_stage("restart_failed", remote_version=pending["to_version"],
+                                   attempt=pending["restart_attempts"])
                 logger.error("[LOTS UPDATER] Restart после установки не удался.", exc_info=True)
             if not activation_shutdown.is_set():
                 logger.warning("[LOTS UPDATER] restart_program вернулся; activation будет перепроверена перед retry.")
@@ -1480,6 +1632,7 @@ def init_commands(cardinal: Cardinal):
                 elif result.get("status") == "busy":
                     retry_due()
             except Exception as exc:
+                emit_updater_stage("install_failed")
                 logger.error("[LOTS UPDATER] Отложенная установка не удалась: %s", exc, exc_info=True)
                 try:
                     durable, status, _ = recover_failed_candidate_file(updater_file, token, int(time.time()))
@@ -1515,6 +1668,7 @@ def init_commands(cardinal: Cardinal):
             try:
                 process_check_result(check_for_update(generation))
             except Exception as exc:
+                emit_updater_stage("check_failed")
                 logger.error("[LOTS UPDATER] Автопроверка не удалась: %s", exc, exc_info=True)
         threading.Thread(target=worker, name="LotsManagerUpdater", daemon=True).start()
 
@@ -1529,6 +1683,7 @@ def init_commands(cardinal: Cardinal):
                     "last_checked_at": int(time.time()), "last_version": remote_version,
                 }))
             except Exception as exc:
+                emit_updater_stage("check_failed")
                 logger.error("[LOTS UPDATER] Startup VERSION check failed: %s", exc, exc_info=True)
         threading.Thread(target=worker, name="LotsManagerStartupVersionCheck", daemon=True).start()
 
@@ -6048,6 +6203,7 @@ def init_commands(cardinal: Cardinal):
                 text = updater_result_text(result)
                 process_check_result(result)
             except Exception as exc:
+                emit_updater_stage("check_failed")
                 logger.error("[LOTS UPDATER] Ручная проверка не удалась: %s", exc, exc_info=True)
                 text = "❌ Обновление не установлено. Проверьте подключение и логи Cardinal."
             try:
@@ -6094,6 +6250,7 @@ def init_commands(cardinal: Cardinal):
                     elif result.get("status") == "busy":
                         schedule_candidate_deadline()
                 except Exception as exc:
+                    emit_updater_stage("install_failed")
                     logger.error("[LOTS UPDATER] Установка candidate не удалась: %s", exc, exc_info=True)
                     try:
                         durable, failure_status, recovered = recover_failed_candidate_file(
@@ -6182,7 +6339,8 @@ def init_commands(cardinal: Cardinal):
         ("lots_tags", "создать/обновить теги для всех лотов", True),
         ("tags_help", "справка по использованию тегов", True),
         ("edit_lot_tag", "изменить тег конкретного лота", True),
-        ("lots_update", "настройки и проверка обновлений LotsManager", True)
+        ("lots_update", "настройки и проверка обновлений LotsManager", True),
+        ("lmlogs", "включить или выключить live logs обновления", True)
     ])
 
     tg.msg_handler(gate_handler(act_copy_lots), commands=["copy_lots"])
@@ -6202,6 +6360,7 @@ def init_commands(cardinal: Cardinal):
     tg.msg_handler(gate_handler(show_lot_tags_help), commands=["tags_help"])
     tg.msg_handler(gate_handler(edit_lot_tag), commands=["edit_lot_tag"])
     tg.msg_handler(lots_update_command, commands=["lots_update"])
+    tg.msg_handler(lmlogs_command, commands=["lmlogs"])
     tg.msg_handler(handle_filter_value, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_FILTER_VALUE))
     tg.msg_handler(handle_create_value, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_CREATE_VALUE))
     tg.msg_handler(handle_edit_price, func=lambda m: tg.check_state(m.chat.id, m.from_user.id, CBT_EDIT_LOT_PRICE))

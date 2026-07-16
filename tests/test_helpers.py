@@ -17,6 +17,7 @@ except ImportError:
 PLUGIN_PATH = Path(__file__).parents[1] / "LotsManager.py"
 HELPERS = {
     "html_text",
+    "render_updater_live_status",
     "sanitize_lot_fields",
     "parse_optional_bool",
     "validate_price_value",
@@ -81,6 +82,9 @@ def load_helpers():
         "UPDATER_VERSION_PATH": "VERSION", "UPDATER_SETTINGS_FILE": "storage/plugins/lots_manager_updater.json",
         "UPDATER_SETTINGS_SCHEMA": 4, "UPDATER_RESTART_DELAY": 3600,
         "UPDATER_MAX_ACTIVATION_RESTARTS": 3, "VERSION": "1.4.2",
+        "UPDATER_STAGE_LABELS": {
+            "waiting": "Ожидание следующей проверки", "check_failed": "Проверка обновлений не удалась",
+        },
         "fcntl": None, "updater_file_fallback_lock": threading.RLock(),
         "updater_settings": {"schema": 4, "local_version": "1.4.2", "enabled": True,
                              "features": {"auto_updates": True}, "last_checked_at": 0, "last_commit": None,
@@ -103,6 +107,23 @@ class HelperTests(unittest.TestCase):
 
     def test_html_text_escapes_untrusted_markup(self):
         self.assertEqual(self.helpers["html_text"]('<b>x</b> & "y"'), "&lt;b&gt;x&lt;/b&gt; &amp; &quot;y&quot;")
+
+    def test_live_updater_status_is_sanitized_and_bounded(self):
+        render = self.helpers["render_updater_live_status"]
+        text = render("check_failed", local_version='<b>1.4.2</b>',
+                      remote_version='<script>x</script>', attempt=99, sequence=-5)
+        self.assertIn("Проверка обновлений не удалась", text)
+        self.assertIn("&lt;b&gt;1.4.2&lt;/b&gt;", text)
+        self.assertIn("&lt;script&gt;x&lt;/script&gt;", text)
+        self.assertNotIn("<script>", text)
+        self.assertIn("3/3", text)
+        self.assertLessEqual(len(text), 3500)
+
+    def test_unknown_live_updater_stage_has_generic_safe_label(self):
+        text = self.helpers["render_updater_live_status"](
+            "/tmp/secret traceback token", local_version="1.4.2", sequence=1)
+        self.assertIn("Обновление статуса", text)
+        self.assertNotIn("/tmp/secret", text)
 
     def test_sanitizer_removes_secrets_without_mutating_input(self):
         fields = {"price": "10", "csrf_token": "x", "offer_id": "1", "golden_key": "g", "secrets": "s", "auto_delivery": True}

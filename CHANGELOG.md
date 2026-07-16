@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Добавлена команда `/lmlogs`, которая включает личный live-статус безопасных этапов проверки, установки и restart.
+
 ## 1.4.2
 
 - Activation restart перечитывает durable updater state перед restart и retry, поэтому старый экземпляр плагина не может воскресить уже очищенный marker.
