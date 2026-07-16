@@ -27,7 +27,16 @@ HELPERS = {
     "parse_subcategory_ids_input",
     "version_tuple",
     "validate_update_source",
+    "parse_version_document",
+    "update_action",
+    "normalize_pending_restart",
+    "pending_restart_token",
+    "pending_restart_is_actionable",
+    "auto_update_allowed",
+    "normalize_recipient_ids",
+    "startup_notice_plan",
     "build_update_urls",
+    "normalize_updater_settings",
 }
 
 
@@ -45,6 +54,11 @@ def load_helpers():
         "urlparse": urlparse, "ast": ast, "re": re,
         "NAME": "LotsManager", "UUID": "5693f220-bcc6-4f6e-9745-9dee8664cbb2",
         "UPDATER_OWNER": "voterol", "UPDATER_REPO": "FpcLotsManager", "UPDATER_SOURCE_PATH": "LotsManager.py",
+        "UPDATER_VERSION_PATH": "VERSION", "UPDATER_SETTINGS_SCHEMA": 2,
+        "updater_settings": {"schema": 2, "enabled": True, "last_checked_at": 0, "last_commit": None,
+                             "last_version": None, "startup_notice_version": None,
+                             "startup_notice_recipients": [], "startup_notice_recipients_version": None,
+                             "pending_restart": None},
     }
     module = ast.Module(body=selected, type_ignores=[])
     module.body.insert(0, ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0))
@@ -254,16 +268,98 @@ BIND_TO_DELETE = None
         with self.assertRaises(SyntaxError):
             validate(source + "if")
         current_source = PLUGIN_PATH.read_text(encoding="utf-8")
-        self.assertEqual(validate(current_source)["VERSION"], "1.1.0")
+        self.assertEqual(validate(current_source)["VERSION"], "1.2.0")
+
+    def test_root_version_matches_plugin_metadata(self):
+        root_version = (PLUGIN_PATH.parent / "VERSION").read_text(encoding="utf-8")
+        self.assertEqual(self.helpers["parse_version_document"](root_version), "1.2.0")
+        self.assertEqual(self.helpers["validate_update_source"](PLUGIN_PATH.read_text(encoding="utf-8"))["VERSION"], "1.2.0")
+
+    def test_version_document_and_update_direction(self):
+        parse = self.helpers["parse_version_document"]
+        self.assertEqual(parse("1.2.0\n"), "1.2.0")
+        for invalid in ("v1.2.0", "1.2.0\nextra", " 1.2.0\n"):
+            with self.assertRaises(ValueError):
+                parse(invalid)
+        action = self.helpers["update_action"]
+        self.assertEqual(action("1.2.0", "1.2.0"), "current")
+        self.assertEqual(action("1.2.0", "1.3.0"), "install")
+        self.assertEqual(action("1.2.0", "1.1.9"), "newer-local")
 
     def test_update_urls_require_immutable_commit(self):
         build = self.helpers["build_update_urls"]
         sha = "a" * 40
-        api_url, raw_url = build(sha)
-        self.assertEqual(api_url, "https://api.github.com/repos/voterol/FpcLotsManager/commits?path=LotsManager.py&sha=main&per_page=1")
-        self.assertEqual(raw_url, f"https://raw.githubusercontent.com/voterol/FpcLotsManager/{sha}/LotsManager.py")
+        api_url, version_url, source_url = build(sha)
+        self.assertEqual(api_url, "https://api.github.com/repos/voterol/FpcLotsManager/commits?path=VERSION&sha=main&per_page=1")
+        self.assertEqual(version_url, f"https://raw.githubusercontent.com/voterol/FpcLotsManager/{sha}/VERSION")
+        self.assertEqual(source_url, f"https://raw.githubusercontent.com/voterol/FpcLotsManager/{sha}/LotsManager.py")
         with self.assertRaises(ValueError):
             build("main")
+
+    def test_updater_settings_migration_defaults_on_and_preserves_explicit_opt_out(self):
+        normalize = self.helpers["normalize_updater_settings"]
+        self.assertTrue(normalize({}, 100)["enabled"])
+        self.assertTrue(normalize({"schema": 1, "consent": "unknown", "enabled": False}, 100)["enabled"])
+        self.assertFalse(normalize({"schema": 1, "consent": "declined", "enabled": False}, 100)["enabled"])
+        self.assertTrue(normalize({"schema": 1, "consent": "accepted", "enabled": True}, 100)["enabled"])
+        current = normalize({"schema": 2, "enabled": False}, 100)
+        self.assertFalse(current["enabled"])
+
+    def test_pending_restart_validation_is_strict_and_forward_only(self):
+        normalize = self.helpers["normalize_pending_restart"]
+        valid = {"deadline": 123, "from_version": "1.2.0", "to_version": "1.3.0"}
+        self.assertEqual(normalize(valid), valid)
+        invalid = [
+            None,
+            {**valid, "deadline": 0},
+            {**valid, "deadline": 1.5},
+            {**valid, "deadline": True},
+            {**valid, "to_version": "1.2.0"},
+            {**valid, "to_version": "1.1.0"},
+            {**valid, "extra": "x"},
+            {**valid, "from_version": "v1.2.0"},
+        ]
+        for value in invalid:
+            with self.subTest(value=value):
+                self.assertIsNone(normalize(value))
+
+    def test_pending_token_and_auto_generation_are_deterministic(self):
+        pending = {"deadline": 123, "from_version": "1.2.0", "to_version": "1.3.0"}
+        self.assertEqual(self.helpers["pending_restart_token"](pending), ("1.3.0", 123))
+        actionable = self.helpers["pending_restart_is_actionable"]
+        self.assertTrue(actionable(pending, "1.2.0"))
+        self.assertFalse(actionable(pending, "1.3.0"))
+        self.assertFalse(actionable(pending, "1.4.0"))
+        allowed = self.helpers["auto_update_allowed"]
+        self.assertTrue(allowed(True, 4, 4))
+        self.assertFalse(allowed(False, 4, 4))
+        self.assertFalse(allowed(True, 4, 5))
+
+    def test_startup_recipient_state_is_strict_and_deduplicated(self):
+        normalize = self.helpers["normalize_recipient_ids"]
+        self.assertEqual(normalize([3, 1, 3, True, 0, -1, "2", 2]), [3, 1, 2])
+        self.assertEqual(normalize((1, 2)), [])
+        plan = self.helpers["startup_notice_plan"]
+        self.assertEqual(plan((3, 1, 3, "bad", 2), [1, 9]), ((3, 1, 2), (3, 2)))
+        self.assertEqual(plan([], [1]), ((), ()))
+
+    def test_updater_settings_validates_startup_recipient_progress(self):
+        normalize = self.helpers["normalize_updater_settings"]
+        result = normalize({
+            "schema": 2,
+            "enabled": True,
+            "startup_notice_version": "1.2.0",
+            "startup_notice_recipients_version": "1.2.0",
+            "startup_notice_recipients": [10, 10, True, -1, 20],
+        }, 100)
+        self.assertEqual(result["startup_notice_recipients"], [10, 20])
+        self.assertEqual(result["startup_notice_recipients_version"], "1.2.0")
+        invalid = normalize({
+            "schema": 2, "enabled": True,
+            "startup_notice_recipients_version": "current",
+            "startup_notice_recipients": [10],
+        }, 100)
+        self.assertIsNone(invalid["startup_notice_recipients_version"])
 
     def test_version_tuple_uses_numeric_comparison(self):
         parse = self.helpers["version_tuple"]
