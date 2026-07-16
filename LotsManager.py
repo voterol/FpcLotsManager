@@ -383,6 +383,18 @@ def candidate_after_disable(candidate, now: int) -> dict | None:
     return current
 
 
+def candidate_after_install_failure(candidate, expected_token: str, now: int) -> tuple[str, dict | None]:
+    """Release only the matching failed install claim so the candidate can be retried."""
+    current = normalize_update_candidate(candidate, now)
+    if current is None or current["token"] != expected_token:
+        return "stale", current
+    if current["decision"] != "installing":
+        return "unchanged", current
+    # Keep the candidate actionable but do not arm another automatic deterministic retry.
+    current.update({"decision": None, "deadline": now + UPDATER_RESTART_DELAY})
+    return "retryable", current
+
+
 def normalize_install_notice(value) -> dict | None:
     """Strictly validate durable post-restart notification progress."""
     required = {"commit", "version", "from_version", "recipients", "notified"}
@@ -609,6 +621,20 @@ def mutate_updater_state_file(file_path: str | Path, now: int, mutator,
         finally:
             if fcntl is not None:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def recover_failed_candidate_file(file_path: str | Path, expected_token: str, now: int) -> tuple[dict, str, dict | None]:
+    """Release a failed install claim using the current durable candidate as a CAS boundary."""
+    outcome = {"status": "stale", "candidate": None}
+    def recover(state):
+        status, candidate = candidate_after_install_failure(state.get("candidate"), expected_token, now)
+        outcome.update({"status": status, "candidate": candidate})
+        if status == "retryable":
+            state["candidate"] = candidate
+            return True
+        return False
+    state, _ = mutate_updater_state_file(file_path, now, recover)
+    return state, outcome["status"], outcome["candidate"]
 
 
 def fetch_published_version() -> str:
@@ -1454,9 +1480,17 @@ def init_commands(cardinal: Cardinal):
                 elif result.get("status") == "busy":
                     retry_due()
             except Exception as exc:
-                # Keep installing state: restart restoration retries the exact immutable candidate.
                 logger.error("[LOTS UPDATER] Отложенная установка не удалась: %s", exc, exc_info=True)
-                retry_due(300)
+                try:
+                    durable, status, _ = recover_failed_candidate_file(updater_file, token, int(time.time()))
+                    with updater_lock:
+                        updater_settings.clear()
+                        updater_settings.update(durable)
+                    if status == "retryable":
+                        schedule_candidate_deadline()
+                except Exception:
+                    logger.error("[LOTS UPDATER] Не удалось восстановить candidate; повтор через минуту.", exc_info=True)
+                    retry_due(60)
         delay = max(0, candidate["deadline"] - int(time.time()))
         if candidate["decision"] == "installing":
             delay = 0
@@ -6061,7 +6095,32 @@ def init_commands(cardinal: Cardinal):
                         schedule_candidate_deadline()
                 except Exception as exc:
                     logger.error("[LOTS UPDATER] Установка candidate не удалась: %s", exc, exc_info=True)
-                    schedule_candidate_deadline()
+                    try:
+                        durable, failure_status, recovered = recover_failed_candidate_file(
+                            updater_file, token, int(time.time()))
+                        with updater_lock:
+                            updater_settings.clear()
+                            updater_settings.update(durable)
+                        if failure_status == "retryable" and recovered:
+                            schedule_candidate_deadline()
+                            bot.send_message(
+                                call.message.chat.id,
+                                "❌ Обновление не установлено. Решение сброшено — устраните вторую копию "
+                                "LotsManager с тем же UUID и нажмите «Обновить сейчас» повторно.",
+                                reply_markup=prompt_keyboard(recovered),
+                            )
+                        elif failure_status == "unchanged":
+                            bot.send_message(call.message.chat.id,
+                                             "❌ Обновление не установлено. Проверьте логи Cardinal.")
+                    except Exception:
+                        logger.error("[LOTS UPDATER] Не удалось восстановить candidate после ошибки установки.",
+                                     exc_info=True)
+                        try:
+                            bot.send_message(call.message.chat.id,
+                                             "❌ Установка не удалась, состояние обновления не восстановлено. "
+                                             "Проверьте логи Cardinal.")
+                        except Exception:
+                            logger.debug("[LOTS UPDATER] Не удалось отправить ошибку установки.", exc_info=True)
             threading.Thread(target=worker, name="LotsManagerInstallNow", daemon=True).start()
         elif transition == "later":
             schedule_candidate_deadline()

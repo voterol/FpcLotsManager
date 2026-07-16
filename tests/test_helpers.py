@@ -44,6 +44,7 @@ HELPERS = {
     "normalize_update_candidate",
     "candidate_decision",
     "candidate_after_disable",
+    "candidate_after_install_failure",
     "normalize_install_notice",
     "normalize_pending_activation",
     "activation_after_start",
@@ -57,6 +58,7 @@ HELPERS = {
     "load_updater_state",
     "load_or_reset_updater_state",
     "mutate_updater_state_file",
+    "recover_failed_candidate_file",
     "atomic_write_json",
 }
 
@@ -448,6 +450,51 @@ BIND_TO_DELETE = None
         self.assertIsNone(disable(candidate, 200))
         candidate["decision"] = "installing"
         self.assertEqual(disable(candidate, 200)["decision"], "installing")
+
+    def test_failed_install_releases_matching_claim_for_retry(self):
+        sha = "a" * 40
+        candidate = {"commit": sha, "version": "1.5.0", "token": sha[:12], "decision": "installing",
+                     "detected_at": 100, "deadline": 200, "recipients": [1, 2], "prompted": [1]}
+        recover = self.helpers["candidate_after_install_failure"]
+        status, recovered = recover(candidate, sha[:12], 300)
+        self.assertEqual(status, "retryable")
+        self.assertIsNone(recovered["decision"])
+        self.assertEqual(recovered["deadline"], 3900)
+        self.assertEqual((recovered["commit"], recovered["token"]), (sha, sha[:12]))
+        self.assertEqual(candidate["decision"], "installing")
+        transition, retried = self.helpers["candidate_decision"](recovered, sha[:12], "now", 301)
+        self.assertEqual(transition, "install")
+        self.assertEqual(retried["decision"], "installing")
+
+    def test_failed_install_cannot_release_stale_or_unclaimed_candidate(self):
+        sha = "a" * 40
+        recover = self.helpers["candidate_after_install_failure"]
+        candidate = {"commit": sha, "version": "1.5.0", "token": sha[:12], "decision": "installing",
+                     "detected_at": 100, "deadline": 200, "recipients": [], "prompted": []}
+        self.assertEqual(recover(candidate, "b" * 12, 300)[0], "stale")
+        for decision in (None, "later"):
+            status, unchanged = recover({**candidate, "decision": decision}, sha[:12], 300)
+            self.assertEqual(status, "unchanged")
+            self.assertEqual(unchanged["decision"], decision)
+
+    def test_failed_install_recovery_uses_current_durable_candidate(self):
+        recover = self.helpers["recover_failed_candidate_file"]
+        mutate = self.helpers["mutate_updater_state_file"]
+        sha = "a" * 40
+        candidate = {"commit": sha, "version": "1.5.0", "token": sha[:12], "decision": "installing",
+                     "detected_at": 100, "deadline": 200, "recipients": [], "prompted": []}
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "updater.json"
+            mutate(path, 200, lambda state: state.update({"candidate": candidate}) or True)
+            state, status, recovered = recover(path, sha[:12], 300)
+            self.assertEqual(status, "retryable")
+            self.assertIsNone(recovered["decision"])
+            self.assertEqual(state["candidate"], recovered)
+            mutate(path, 301, lambda state: state.update({"candidate": None}) or True)
+            state, status, recovered = recover(path, sha[:12], 302)
+            self.assertEqual(status, "stale")
+            self.assertIsNone(recovered)
+            self.assertIsNone(state["candidate"])
 
     def test_install_notice_is_strict_and_filters_progress(self):
         normalize = self.helpers["normalize_install_notice"]
