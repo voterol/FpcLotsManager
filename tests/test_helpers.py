@@ -37,6 +37,14 @@ HELPERS = {
     "normalize_recipient_ids",
     "startup_notice_plan",
     "build_update_urls",
+    "candidate_token",
+    "normalize_update_candidate",
+    "candidate_decision",
+    "candidate_after_disable",
+    "normalize_install_notice",
+    "normalize_pending_activation",
+    "activation_after_start",
+    "recover_candidate_for_running_version",
     "normalize_updater_settings",
 }
 
@@ -55,11 +63,12 @@ def load_helpers():
         "urlparse": urlparse, "ast": ast, "re": re,
         "NAME": "LotsManager", "UUID": "5693f220-bcc6-4f6e-9745-9dee8664cbb2",
         "UPDATER_OWNER": "voterol", "UPDATER_REPO": "FpcLotsManager", "UPDATER_SOURCE_PATH": "LotsManager.py",
-        "UPDATER_VERSION_PATH": "VERSION", "UPDATER_SETTINGS_SCHEMA": 2,
-        "updater_settings": {"schema": 2, "enabled": True, "last_checked_at": 0, "last_commit": None,
+        "UPDATER_VERSION_PATH": "VERSION", "UPDATER_SETTINGS_SCHEMA": 3, "UPDATER_RESTART_DELAY": 3600,
+        "updater_settings": {"schema": 3, "enabled": True, "last_checked_at": 0, "last_commit": None,
                              "last_version": None, "startup_notice_version": None,
                              "startup_notice_recipients": [], "startup_notice_recipients_version": None,
-                             "pending_restart": None},
+                             "pending_restart": None, "candidate": None, "ignored_commits": [], "install_notice": None,
+                             "pending_activation": None},
     }
     module = ast.Module(body=selected, type_ignores=[])
     module.body.insert(0, ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0))
@@ -295,12 +304,12 @@ BIND_TO_DELETE = None
         with self.assertRaises(SyntaxError):
             validate(source + "if")
         current_source = PLUGIN_PATH.read_text(encoding="utf-8")
-        self.assertEqual(validate(current_source)["VERSION"], "1.3.0")
+        self.assertEqual(validate(current_source)["VERSION"], "1.4.0")
 
     def test_root_version_matches_plugin_metadata(self):
         root_version = (PLUGIN_PATH.parent / "VERSION").read_text(encoding="utf-8")
-        self.assertEqual(self.helpers["parse_version_document"](root_version), "1.3.0")
-        self.assertEqual(self.helpers["validate_update_source"](PLUGIN_PATH.read_text(encoding="utf-8"))["VERSION"], "1.3.0")
+        self.assertEqual(self.helpers["parse_version_document"](root_version), "1.4.0")
+        self.assertEqual(self.helpers["validate_update_source"](PLUGIN_PATH.read_text(encoding="utf-8"))["VERSION"], "1.4.0")
 
     def test_version_document_and_update_direction(self):
         parse = self.helpers["parse_version_document"]
@@ -329,8 +338,74 @@ BIND_TO_DELETE = None
         self.assertTrue(normalize({"schema": 1, "consent": "unknown", "enabled": False}, 100)["enabled"])
         self.assertFalse(normalize({"schema": 1, "consent": "declined", "enabled": False}, 100)["enabled"])
         self.assertTrue(normalize({"schema": 1, "consent": "accepted", "enabled": True}, 100)["enabled"])
-        current = normalize({"schema": 2, "enabled": False}, 100)
+        current = normalize({"schema": 3, "enabled": False}, 100)
         self.assertFalse(current["enabled"])
+        self.assertFalse(normalize({"schema": 2, "enabled": False}, 100)["enabled"])
+
+    def test_candidate_first_valid_decision_wins_and_token_is_stale_safe(self):
+        sha = "a" * 40
+        candidate = {"commit": sha, "version": "1.5.0", "token": sha[:12], "decision": None,
+                     "detected_at": 100, "deadline": 3700, "recipients": [1, 2], "prompted": [1]}
+        decide = self.helpers["candidate_decision"]
+        status, later = decide(candidate, sha[:12], "later", 200)
+        self.assertEqual(status, "later")
+        self.assertEqual(later["deadline"], 3800)
+        self.assertEqual(decide(later, sha[:12], "now", 201)[0], "decided")
+        self.assertEqual(decide(candidate, "b" * 12, "now", 200)[0], "stale")
+        status, ignored = decide(candidate, sha[:12], "no", 200)
+        self.assertEqual((status, ignored), ("ignored", None))
+
+    def test_disable_cancels_pending_candidate_but_keeps_claimed_install(self):
+        sha = "a" * 40
+        candidate = {"commit": sha, "version": "1.5.0", "token": sha[:12], "decision": None,
+                     "detected_at": 100, "deadline": 3700, "recipients": [1], "prompted": []}
+        disable = self.helpers["candidate_after_disable"]
+        self.assertIsNone(disable(candidate, 200))
+        candidate["decision"] = "later"
+        self.assertIsNone(disable(candidate, 200))
+        candidate["decision"] = "installing"
+        self.assertEqual(disable(candidate, 200)["decision"], "installing")
+
+    def test_install_notice_is_strict_and_filters_progress(self):
+        normalize = self.helpers["normalize_install_notice"]
+        notice = {"commit": "a" * 40, "version": "1.5.0", "from_version": "1.4.0",
+                  "recipients": [1, 2, 2], "notified": [2, 3]}
+        self.assertEqual(normalize(notice)["notified"], [2])
+        self.assertIsNone(normalize({**notice, "extra": True}))
+        self.assertIsNone(normalize({**notice, "commit": "main"}))
+        self.assertIsNone(normalize({**notice, "version": "v1.5"}))
+
+    def test_recovery_turns_already_running_candidate_into_post_start_notice(self):
+        sha = "a" * 40
+        candidate = {"commit": sha, "version": "1.4.0", "token": sha[:12], "decision": "installing",
+                     "detected_at": 100, "deadline": 200, "recipients": [1, 2], "prompted": [1]}
+        recover = self.helpers["recover_candidate_for_running_version"]
+        pending, notice, status = recover(candidate, None, "1.4.0", 300)
+        self.assertIsNone(pending)
+        self.assertEqual(status, "installed")
+        self.assertEqual(notice["recipients"], [1, 2])
+        future = {**candidate, "version": "1.5.0"}
+        self.assertEqual(recover(future, None, "1.4.0", 300)[2], "pending")
+
+    def test_recovery_replaces_notice_for_another_commit(self):
+        sha = "a" * 40
+        candidate = {"commit": sha, "version": "1.4.0", "token": sha[:12], "decision": "installing",
+                     "detected_at": 100, "deadline": 200, "recipients": [7], "prompted": []}
+        old_notice = {"commit": "b" * 40, "version": "1.3.0", "from_version": "1.2.0",
+                      "recipients": [1], "notified": [1]}
+        _, notice, status = self.helpers["recover_candidate_for_running_version"](
+            candidate, old_notice, "1.4.0", 300)
+        self.assertEqual(status, "installed")
+        self.assertEqual((notice["commit"], notice["version"], notice["recipients"]), (sha, "1.4.0", [7]))
+
+    def test_pending_activation_clears_only_when_running_version_proves_activation(self):
+        pending = {"commit": "a" * 40, "from_version": "1.4.0", "to_version": "1.5.0",
+                   "installed_at": 100, "restart_attempts": 2, "next_retry_at": 130}
+        transition = self.helpers["activation_after_start"]
+        self.assertEqual(transition(pending, "1.4.0"), (pending, False))
+        self.assertEqual(transition(pending, "1.5.0"), (None, True))
+        self.assertEqual(transition(pending, "1.6.0"), (None, True))
+        self.assertIsNone(self.helpers["normalize_pending_activation"]({**pending, "restart_attempts": True}))
 
     def test_pending_restart_validation_is_strict_and_forward_only(self):
         normalize = self.helpers["normalize_pending_restart"]
