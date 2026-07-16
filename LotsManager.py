@@ -40,7 +40,7 @@ except ImportError:  # Windows Cardinal installations use the in-process fallbac
 
 
 NAME = "LotsManager"
-VERSION = "1.4.3"
+VERSION = "1.4.4"
 DESCRIPTION = "Плагин для копирования и управления лотами через inline кнопки."
 CREDITS = "@woopertail, @sidor0912, @voterol (gpt5.6-sol)"
 UUID = "5693f220-bcc6-4f6e-9745-9dee8664cbb2"
@@ -430,7 +430,9 @@ def candidate_after_install_failure(candidate, expected_token: str, now: int) ->
     if current["decision"] != "installing":
         return "unchanged", current
     # Keep the candidate actionable but do not arm another automatic deterministic retry.
-    current.update({"decision": None, "deadline": now + UPDATER_RESTART_DELAY})
+    # ``prompted`` belongs to the decision round, not to the candidate lifetime.
+    # A failed claimed installation opens a new round and must ask recipients again.
+    current.update({"decision": None, "deadline": now + UPDATER_RESTART_DELAY, "prompted": []})
     return "retryable", current
 
 
@@ -607,6 +609,14 @@ def merge_updater_snapshot(durable: dict, snapshot: dict) -> bool:
             snapshot_pending = durable_pending
     snapshot["pending_activation"] = snapshot_pending
     snapshot["completed_activations"] = completed
+    durable_candidate = normalize_update_candidate(durable.get("candidate"), int(time.time()))
+    snapshot_candidate = normalize_update_candidate(snapshot.get("candidate"), int(time.time()))
+    if durable_candidate and snapshot_candidate and durable_candidate["token"] == snapshot_candidate["token"]:
+        snapshot["candidate"] = durable_candidate
+    elif durable_candidate and snapshot_candidate is None and durable_candidate["decision"] == "installing":
+        activation = normalize_pending_activation(snapshot.get("pending_activation"))
+        if activation is None or activation["commit"] != durable_candidate["commit"]:
+            snapshot["candidate"] = durable_candidate
     durable.clear()
     durable.update(snapshot)
     return True
@@ -680,6 +690,60 @@ def recover_failed_candidate_file(file_path: str | Path, expected_token: str, no
         return False
     state, _ = mutate_updater_state_file(file_path, now, recover)
     return state, outcome["status"], outcome["candidate"]
+
+
+def decide_candidate_file(file_path: str | Path, token: str, action: str,
+                          now: int) -> tuple[dict, str, dict | None]:
+    """Claim the first candidate decision against current durable state."""
+    outcome = {"status": "stale", "candidate": None}
+    def decide(state):
+        status, candidate = candidate_decision(state.get("candidate"), token, action, now)
+        outcome.update({"status": status, "candidate": candidate})
+        if status == "ignored":
+            current = state.get("candidate") or {}
+            ignored = list(state.get("ignored_commits", []))
+            if current.get("commit") not in ignored:
+                ignored.append(current.get("commit"))
+            state["ignored_commits"] = [item for item in ignored if item][-20:]
+            state["candidate"] = None
+            return True
+        if status in {"install", "later"}:
+            state["candidate"] = candidate
+            return True
+        return False
+    state, _ = mutate_updater_state_file(file_path, now, decide)
+    return state, outcome["status"], outcome["candidate"]
+
+
+def claim_due_candidate_file(file_path: str | Path, token: str,
+                             now: int) -> tuple[dict, bool, dict | None]:
+    """Atomically claim an undecided or deferred candidate when its deadline is due."""
+    outcome = {"claimed": False, "candidate": None}
+    def claim(state):
+        candidate = normalize_update_candidate(state.get("candidate"), now)
+        outcome["candidate"] = candidate
+        if (candidate is None or candidate["token"] != token or candidate["deadline"] > now
+                or candidate["decision"] not in (None, "later")):
+            return False
+        candidate.update({"decision": "installing", "deadline": now})
+        state["candidate"] = candidate
+        outcome.update({"claimed": True, "candidate": candidate})
+        return True
+    state, _ = mutate_updater_state_file(file_path, now, claim)
+    return state, outcome["claimed"], outcome["candidate"]
+
+
+def mark_candidate_prompted_file(file_path: str | Path, token: str, user_id: int,
+                                 now: int) -> tuple[dict, bool]:
+    """Persist prompt delivery only while the same candidate remains undecided."""
+    def mark(state):
+        candidate = normalize_update_candidate(state.get("candidate"), now)
+        if candidate is None or candidate["token"] != token or candidate["decision"] is not None:
+            return False
+        candidate["prompted"] = normalize_recipient_ids(candidate["prompted"] + [user_id])
+        state["candidate"] = candidate
+        return True
+    return mutate_updater_state_file(file_path, now, mark)
 
 
 def fetch_published_version() -> str:
@@ -1347,7 +1411,8 @@ def init_commands(cardinal: Cardinal):
     def send_candidate_prompts(candidate: dict):
         with updater_prompt_lock:
             current = normalize_update_candidate(updater_settings.get("candidate"), int(time.time()))
-            if current is None or current["token"] != candidate["token"]:
+            if (current is None or current["token"] != candidate["token"]
+                    or current["decision"] is not None):
                 return
             recipients = tuple(current["recipients"])
             prompted = set(current["prompted"])
@@ -1358,17 +1423,23 @@ def init_commands(cardinal: Cardinal):
             for user_id in recipients:
                 if user_id in prompted:
                     continue
+                with updater_lock:
+                    current = normalize_update_candidate(updater_settings.get("candidate"), int(time.time()))
+                    if (current is None or current["token"] != candidate["token"]
+                            or current["decision"] is not None):
+                        return
                 try:
                     bot.send_message(user_id, text, parse_mode="HTML", reply_markup=prompt_keyboard(current))
-                    # Telegram I/O is outside updater_lock. Apply only a token-checked field mutation,
-                    # never the stale whole candidate captured before the network call.
+                    # Telegram I/O is outside updater_lock. Record progress against current durable
+                    # state so an old module generation cannot roll back a global decision.
+                    durable, changed = mark_candidate_prompted_file(
+                        updater_file, candidate["token"], user_id, int(time.time()))
                     with updater_lock:
-                        latest = normalize_update_candidate(updater_settings.get("candidate"), int(time.time()))
-                        if latest is None or latest["token"] != candidate["token"]:
+                        updater_settings.clear()
+                        updater_settings.update(durable)
+                        latest = normalize_update_candidate(durable.get("candidate"), int(time.time()))
+                        if not changed or latest is None:
                             return
-                        latest["prompted"] = normalize_recipient_ids(latest["prompted"] + [user_id])
-                        updater_settings["candidate"] = latest
-                        save_updater_settings()
                         prompted = set(latest["prompted"])
                 except Exception:
                     logger.warning("[LOTS UPDATER] Не удалось отправить prompt пользователю %s.", user_id, exc_info=True)
@@ -1620,11 +1691,19 @@ def init_commands(cardinal: Cardinal):
                 if now < current["deadline"]:
                     schedule_candidate_deadline()
                     return
-                # CAS under the same lock as callbacks: only an undecided/later candidate can be claimed.
-                if current["decision"] in (None, "later"):
-                    current["decision"] = "installing"
-                    updater_settings["candidate"] = current
-                    save_updater_settings()
+                if current["decision"] == "installing":
+                    claimed = True
+                elif current["decision"] not in (None, "later"):
+                    return
+                else:
+                    claimed = False
+            if not claimed:
+                durable, claimed, _ = claim_due_candidate_file(updater_file, token, now)
+                with updater_lock:
+                    updater_settings.clear()
+                    updater_settings.update(durable)
+            if not claimed:
+                return
             try:
                 result = install_candidate(token)
                 if result.get("status") == "installed":
@@ -1640,6 +1719,7 @@ def init_commands(cardinal: Cardinal):
                         updater_settings.clear()
                         updater_settings.update(durable)
                     if status == "retryable":
+                        send_candidate_prompts(durable["candidate"])
                         schedule_candidate_deadline()
                 except Exception:
                     logger.error("[LOTS UPDATER] Не удалось восстановить candidate; повтор через минуту.", exc_info=True)
@@ -6221,20 +6301,11 @@ def init_commands(cardinal: Cardinal):
             bot.answer_callback_query(call.id, "Некорректное решение", show_alert=True)
             return
         _, action, token = parts
+        durable, transition, candidate = decide_candidate_file(
+            updater_file, token, action, int(time.time()))
         with updater_lock:
-            transition, candidate = candidate_decision(
-                updater_settings.get("candidate"), token, action, int(time.time()))
-            if transition == "ignored":
-                current = updater_settings.get("candidate") or {}
-                ignored = list(updater_settings.get("ignored_commits", []))
-                if current.get("commit") not in ignored:
-                    ignored.append(current.get("commit"))
-                updater_settings["ignored_commits"] = [item for item in ignored if item][-20:]
-                updater_settings["candidate"] = None
-            elif transition in {"install", "later"}:
-                updater_settings["candidate"] = candidate
-            if transition in {"ignored", "install", "later"}:
-                save_updater_settings()
+            updater_settings.clear()
+            updater_settings.update(durable)
         messages = {
             "stale": "⌛ Candidate устарел.", "decided": "✅ Глобальное решение уже принято.",
             "invalid": "Некорректное решение.", "ignored": "🚫 Этот commit пропущен.",
@@ -6259,13 +6330,8 @@ def init_commands(cardinal: Cardinal):
                             updater_settings.clear()
                             updater_settings.update(durable)
                         if failure_status == "retryable" and recovered:
+                            send_candidate_prompts(recovered)
                             schedule_candidate_deadline()
-                            bot.send_message(
-                                call.message.chat.id,
-                                "❌ Обновление не установлено. Решение сброшено — устраните вторую копию "
-                                "LotsManager с тем же UUID и нажмите «Обновить сейчас» повторно.",
-                                reply_markup=prompt_keyboard(recovered),
-                            )
                         elif failure_status == "unchanged":
                             bot.send_message(call.message.chat.id,
                                              "❌ Обновление не установлено. Проверьте логи Cardinal.")
