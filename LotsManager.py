@@ -35,7 +35,7 @@ import json
 
 
 NAME = "LotsManager"
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 DESCRIPTION = "Плагин для копирования и управления лотами через inline кнопки."
 CREDITS = "@woopertail, @sidor0912, @voterol (gpt5.6-sol)"
 UUID = "5693f220-bcc6-4f6e-9745-9dee8664cbb2"
@@ -53,7 +53,7 @@ UPDATER_VERSION_PATH = "VERSION"
 UPDATER_VERSION_URL = "https://raw.githubusercontent.com/voterol/FpcLotsManager/refs/heads/main/VERSION"
 UPDATER_CHECK_INTERVAL = 60 * 60
 UPDATER_MAX_BYTES = 2 * 1024 * 1024
-UPDATER_SETTINGS_SCHEMA = 3
+UPDATER_SETTINGS_SCHEMA = 4
 UPDATER_CB_TOGGLE = "lm_upd_toggle"
 UPDATER_CB_CHECK = "lm_upd_check"
 UPDATER_CB_STARTUP_DISABLE = "lm_upd_startup_disable"
@@ -170,21 +170,29 @@ updater_lock = threading.RLock()
 updater_prompt_lock = threading.Lock()
 restart_lock = threading.Lock()
 restart_requested = False
-updater_settings = {
-    "schema": UPDATER_SETTINGS_SCHEMA,
-    "enabled": True,
-    "last_checked_at": 0,
-    "last_commit": None,
-    "last_version": None,
-    "startup_notice_version": None,
-    "startup_notice_recipients": [],
-    "startup_notice_recipients_version": None,
-    "pending_restart": None,
-    "candidate": None,
-    "ignored_commits": [],
-    "install_notice": None,
-    "pending_activation": None,
-}
+
+
+def default_updater_settings() -> dict:
+    return {
+        "schema": UPDATER_SETTINGS_SCHEMA,
+        "local_version": VERSION,
+        "enabled": True,
+        "features": {"auto_updates": True},
+        "last_checked_at": 0,
+        "last_commit": None,
+        "last_version": None,
+        "startup_notice_version": None,
+        "startup_notice_recipients": [],
+        "startup_notice_recipients_version": None,
+        "pending_restart": None,
+        "candidate": None,
+        "ignored_commits": [],
+        "install_notice": None,
+        "pending_activation": None,
+    }
+
+
+updater_settings = default_updater_settings()
 
 
 def html_text(value: object) -> str:
@@ -425,12 +433,11 @@ def recover_candidate_for_running_version(candidate, notice, running_version: st
 
 def normalize_updater_settings(loaded, now: int) -> dict:
     """Migrate legacy settings while making fresh/migrated installations default-on."""
-    result = dict(updater_settings)
-    result.update({"schema": UPDATER_SETTINGS_SCHEMA, "enabled": True})
+    result = default_updater_settings()
     if not isinstance(loaded, dict):
         loaded = {}
     # Preserve explicit legacy decline; unknown legacy state and fresh installs become default-on.
-    if loaded.get("schema") in {2, UPDATER_SETTINGS_SCHEMA} and isinstance(loaded.get("enabled"), bool):
+    if loaded.get("schema") in {2, 3, UPDATER_SETTINGS_SCHEMA} and isinstance(loaded.get("enabled"), bool):
         result["enabled"] = loaded["enabled"]
     elif loaded.get("enabled") is False and loaded.get("consent") == "declined":
         result["enabled"] = False
@@ -439,9 +446,12 @@ def normalize_updater_settings(loaded, now: int) -> dict:
     commit = loaded.get("last_commit")
     result["last_commit"] = commit if commit is None or re.fullmatch(r"[0-9a-f]{40}", str(commit)) else None
     remote_version = loaded.get("last_version")
-    if remote_version is not None:
-        version_tuple(remote_version)
-    result["last_version"] = remote_version
+    try:
+        if remote_version is not None:
+            version_tuple(remote_version)
+        result["last_version"] = remote_version
+    except (TypeError, ValueError):
+        result["last_version"] = None
     notice = loaded.get("startup_notice_version")
     result["startup_notice_version"] = notice if notice is None or re.fullmatch(r"\d+\.\d+\.\d+", str(notice)) else None
     result["startup_notice_recipients"] = normalize_recipient_ids(loaded.get("startup_notice_recipients"))
@@ -458,7 +468,79 @@ def normalize_updater_settings(loaded, now: int) -> dict:
     ))[-20:] if isinstance(ignored, list) else []
     result["install_notice"] = normalize_install_notice(loaded.get("install_notice"))
     result["pending_activation"] = normalize_pending_activation(loaded.get("pending_activation"))
+    result["local_version"] = VERSION
+    result["features"] = {"auto_updates": result["enabled"]}
     return result
+
+
+def updater_settings_path(plugin_path: str | Path) -> Path:
+    """Anchor updater state to Cardinal's root instead of the process working directory."""
+    target = Path(plugin_path).expanduser().resolve()
+    if target.parent.name != "plugins":
+        raise ValueError("plugin path is outside the plugins directory")
+    return target.parent.parent / UPDATER_SETTINGS_FILE
+
+
+def load_updater_state(file_path: str | Path, now: int, legacy_path: str | Path | None = None) -> dict:
+    """Load, migrate and durably rewrite updater state from a stable path."""
+    path = Path(file_path)
+    source = path
+    if not source.exists() and legacy_path is not None:
+        legacy = Path(legacy_path)
+        if legacy.resolve() != path.resolve() and legacy.exists():
+            source = legacy
+    loaded = {}
+    if source.exists():
+        with source.open("r", encoding="utf-8") as file:
+            loaded = json.load(file)
+    normalized = normalize_updater_settings(loaded, now)
+    atomic_write_json(path, normalized)
+    return normalized
+
+
+def load_or_reset_updater_state(file_path: str | Path, now: int, legacy_path: str | Path | None = None) -> dict:
+    """Recover malformed state without preventing startup checks."""
+    try:
+        return load_updater_state(file_path, now, legacy_path)
+    except (ValueError, json.JSONDecodeError):
+        normalized = normalize_updater_settings({}, now)
+        atomic_write_json(file_path, normalized)
+        return normalized
+
+
+def fetch_published_version() -> str:
+    """Fetch the small public VERSION document without downloading executable code."""
+    request = Request(UPDATER_VERSION_URL, headers={"Accept": "text/plain", "User-Agent": "LotsManager-Updater"})
+    with urlopen(request, timeout=20) as response:
+        if response.geturl() != UPDATER_VERSION_URL:
+            raise RuntimeError("GitHub Raw redirected VERSION")
+        payload = response.read(129)
+    if len(payload) > 128:
+        raise RuntimeError("VERSION document is too large")
+    return parse_version_document(payload.decode("utf-8"))
+
+
+def schedule_headless_version_checks(updater_file: str | Path) -> None:
+    """Persist startup/hourly comparisons when Cardinal runs without Telegram."""
+    def tick():
+        try:
+            with updater_lock:
+                state = load_or_reset_updater_state(updater_file, int(time.time()), legacy_path=UPDATER_SETTINGS_FILE)
+                state["last_version"] = fetch_published_version()
+                state["last_checked_at"] = int(time.time())
+                atomic_write_json(updater_file, normalize_updater_settings(state, int(time.time())))
+        except Exception:
+            logger.error("[LOTS UPDATER] Headless VERSION check failed.", exc_info=True)
+        finally:
+            timer = threading.Timer(UPDATER_CHECK_INTERVAL, tick)
+            timer.name = "LotsManagerHeadlessHourlyCheck"
+            timer.daemon = True
+            timer.start()
+
+    startup_timer = threading.Timer(0, tick)
+    startup_timer.name = "LotsManagerHeadlessStartupCheck"
+    startup_timer.daemon = True
+    startup_timer.start()
 
 
 def sanitize_lot_fields(fields: dict, *, include_delivery_secrets: bool = False) -> dict:
@@ -831,7 +913,16 @@ def download_file(tg, msg: Message, file_name: str = "temp_file.txt"):
 
 
 def init_commands(cardinal: Cardinal):
+    updater_file = updater_settings_path(__file__)
     if not cardinal.telegram:
+        try:
+            state = load_or_reset_updater_state(updater_file, int(time.time()), legacy_path=UPDATER_SETTINGS_FILE)
+            with updater_lock:
+                updater_settings.clear()
+                updater_settings.update(state)
+        except Exception:
+            logger.error("[LOTS UPDATER] Headless state initialization failed.", exc_info=True)
+        schedule_headless_version_checks(updater_file)
         return
     tg = cardinal.telegram
     bot = cardinal.telegram.bot
@@ -841,23 +932,36 @@ def init_commands(cardinal: Cardinal):
     hourly_timer_state = {"timer": None}
 
     def load_updater_settings():
-        loaded = {}
         try:
-            if exists(UPDATER_SETTINGS_FILE):
-                with open(UPDATER_SETTINGS_FILE, "r", encoding="utf-8") as file:
-                    loaded = json.load(file)
+            loaded = load_updater_state(
+                updater_file,
+                int(time.time()),
+                legacy_path=UPDATER_SETTINGS_FILE,
+            )
             with updater_lock:
                 updater_settings.clear()
-                updater_settings.update(normalize_updater_settings(loaded, int(time.time())))
+                updater_settings.update(loaded)
         except (OSError, ValueError, json.JSONDecodeError):
             logger.error("[LOTS UPDATER] Настройки повреждены; используются значения по умолчанию.")
             with updater_lock:
                 updater_settings.clear()
                 updater_settings.update(normalize_updater_settings({}, int(time.time())))
+                try:
+                    atomic_write_json(updater_file, dict(updater_settings))
+                except OSError:
+                    logger.error("[LOTS UPDATER] Не удалось сохранить настройки по умолчанию.", exc_info=True)
+
+    def persistent_updater_snapshot() -> dict:
+        snapshot = dict(updater_settings)
+        snapshot["schema"] = UPDATER_SETTINGS_SCHEMA
+        snapshot["local_version"] = VERSION
+        snapshot["features"] = {"auto_updates": bool(snapshot.get("enabled"))}
+        return snapshot
 
     def save_updater_settings():
         with updater_lock:
-            atomic_write_json(UPDATER_SETTINGS_FILE, dict(updater_settings))
+            updater_settings.update(persistent_updater_snapshot())
+            atomic_write_json(updater_file, dict(updater_settings))
 
     def settings_snapshot() -> dict:
         with updater_lock:
@@ -867,7 +971,8 @@ def init_commands(cardinal: Cardinal):
         """Single serialization boundary for every state mutation and durable snapshot."""
         with updater_lock:
             mutator(updater_settings)
-            atomic_write_json(UPDATER_SETTINGS_FILE, dict(updater_settings))
+            updater_settings.update(persistent_updater_snapshot())
+            atomic_write_json(updater_file, dict(updater_settings))
             return dict(updater_settings)
 
     def authorized_user_ids() -> tuple[int, ...]:
@@ -907,9 +1012,11 @@ def init_commands(cardinal: Cardinal):
         configured = Path(plugin_data.path)
         if configured.is_symlink():
             raise RuntimeError("файл плагина является символической ссылкой")
+        running_plugin = Path(__file__).resolve()
+        if not configured.is_absolute():
+            configured = running_plugin.parent.parent / configured
         target = configured.resolve()
-        plugins_dir = Path("plugins").resolve()
-        if target.parent != plugins_dir or target.suffix != ".py" or not target.is_file():
+        if target != running_plugin or target.parent.name != "plugins" or target.suffix != ".py" or not target.is_file():
             raise RuntimeError("небезопасный путь файла плагина")
         return target
 
@@ -1244,6 +1351,20 @@ def init_commands(cardinal: Cardinal):
                 logger.error("[LOTS UPDATER] Автопроверка не удалась: %s", exc, exc_info=True)
         threading.Thread(target=worker, name="LotsManagerUpdater", daemon=True).start()
 
+    def startup_version_check():
+        if updater_settings.get("enabled"):
+            maybe_auto_update(force=True)
+            return
+        def worker():
+            try:
+                remote_version = fetch_published_version()
+                mutate_updater_settings(lambda state: state.update({
+                    "last_checked_at": int(time.time()), "last_version": remote_version,
+                }))
+            except Exception as exc:
+                logger.error("[LOTS UPDATER] Startup VERSION check failed: %s", exc, exc_info=True)
+        threading.Thread(target=worker, name="LotsManagerStartupVersionCheck", daemon=True).start()
+
     def schedule_hourly_check(initial_delay: float = 0):
         old = hourly_timer_state.get("timer")
         if old:
@@ -1307,7 +1428,7 @@ def init_commands(cardinal: Cardinal):
     if restored_candidate:
         send_candidate_prompts(restored_candidate)
         schedule_candidate_deadline()
-    schedule_hourly_check(0)
+    schedule_hourly_check(UPDATER_CHECK_INTERVAL)
 
     def perform_restart(expected_token=None):
         global restart_requested
@@ -1348,11 +1469,11 @@ def init_commands(cardinal: Cardinal):
         restart_timer_state.update({"timer": timer, "token": token})
         timer.start()
 
-    def send_startup_notice(schedule_auto_after: bool = False):
+    def send_startup_notice(schedule_auto_after: bool = True):
         def schedule_delayed_auto_update():
             if not schedule_auto_after:
                 return
-            auto_timer = threading.Timer(8.0, maybe_auto_update)
+            auto_timer = threading.Timer(8.0, startup_version_check)
             auto_timer.name = "LotsManagerDelayedAutoUpdate"
             auto_timer.daemon = True
             auto_timer.start()
@@ -1416,13 +1537,10 @@ def init_commands(cardinal: Cardinal):
         mutate_updater_settings(lambda state: state.__setitem__("pending_restart", None))
     else:
         schedule_pending_restart()
-    startup_notice_completed = settings_snapshot().get("startup_notice_version") == VERSION
-    startup_timer = threading.Timer(7.0, send_startup_notice, args=(not startup_notice_completed,))
+    startup_timer = threading.Timer(7.0, send_startup_notice)
     startup_timer.name = "LotsManagerStartupNotice"
     startup_timer.daemon = True
     startup_timer.start()
-    if startup_notice_completed:
-        maybe_auto_update()
 
     def format_seconds(seconds: float) -> str:
         seconds = max(int(seconds), 0)

@@ -1,9 +1,11 @@
 import unittest
 import ast
+import json
 import re
 from html import escape
 from math import isfinite
 from pathlib import Path
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from urllib.parse import urlparse
 try:
     from bs4 import BeautifulSoup
@@ -45,7 +47,12 @@ HELPERS = {
     "normalize_pending_activation",
     "activation_after_start",
     "recover_candidate_for_running_version",
+    "default_updater_settings",
     "normalize_updater_settings",
+    "updater_settings_path",
+    "load_updater_state",
+    "load_or_reset_updater_state",
+    "atomic_write_json",
 }
 
 
@@ -60,11 +67,14 @@ def load_helpers():
             selected.append(node)
     namespace = {
         "escape": escape, "isfinite": isfinite, "BeautifulSoup": BeautifulSoup,
-        "urlparse": urlparse, "ast": ast, "re": re,
+        "urlparse": urlparse, "ast": ast, "re": re, "json": json, "Path": Path,
+        "NamedTemporaryFile": NamedTemporaryFile, "replace": __import__("os").replace,
         "NAME": "LotsManager", "UUID": "5693f220-bcc6-4f6e-9745-9dee8664cbb2",
         "UPDATER_OWNER": "voterol", "UPDATER_REPO": "FpcLotsManager", "UPDATER_SOURCE_PATH": "LotsManager.py",
-        "UPDATER_VERSION_PATH": "VERSION", "UPDATER_SETTINGS_SCHEMA": 3, "UPDATER_RESTART_DELAY": 3600,
-        "updater_settings": {"schema": 3, "enabled": True, "last_checked_at": 0, "last_commit": None,
+        "UPDATER_VERSION_PATH": "VERSION", "UPDATER_SETTINGS_FILE": "storage/plugins/lots_manager_updater.json",
+        "UPDATER_SETTINGS_SCHEMA": 4, "UPDATER_RESTART_DELAY": 3600, "VERSION": "1.4.1",
+        "updater_settings": {"schema": 4, "local_version": "1.4.1", "enabled": True,
+                             "features": {"auto_updates": True}, "last_checked_at": 0, "last_commit": None,
                              "last_version": None, "startup_notice_version": None,
                              "startup_notice_recipients": [], "startup_notice_recipients_version": None,
                              "pending_restart": None, "candidate": None, "ignored_commits": [], "install_notice": None,
@@ -304,12 +314,19 @@ BIND_TO_DELETE = None
         with self.assertRaises(SyntaxError):
             validate(source + "if")
         current_source = PLUGIN_PATH.read_text(encoding="utf-8")
-        self.assertEqual(validate(current_source)["VERSION"], "1.4.0")
+        root_version = self.helpers["parse_version_document"](
+            (PLUGIN_PATH.parent / "VERSION").read_text(encoding="utf-8")
+        )
+        self.assertEqual(validate(current_source)["VERSION"], root_version)
 
     def test_root_version_matches_plugin_metadata(self):
-        root_version = (PLUGIN_PATH.parent / "VERSION").read_text(encoding="utf-8")
-        self.assertEqual(self.helpers["parse_version_document"](root_version), "1.4.0")
-        self.assertEqual(self.helpers["validate_update_source"](PLUGIN_PATH.read_text(encoding="utf-8"))["VERSION"], "1.4.0")
+        root_version = self.helpers["parse_version_document"](
+            (PLUGIN_PATH.parent / "VERSION").read_text(encoding="utf-8")
+        )
+        plugin_version = self.helpers["validate_update_source"](
+            PLUGIN_PATH.read_text(encoding="utf-8")
+        )["VERSION"]
+        self.assertEqual(plugin_version, root_version)
 
     def test_version_document_and_update_direction(self):
         parse = self.helpers["parse_version_document"]
@@ -338,9 +355,68 @@ BIND_TO_DELETE = None
         self.assertTrue(normalize({"schema": 1, "consent": "unknown", "enabled": False}, 100)["enabled"])
         self.assertFalse(normalize({"schema": 1, "consent": "declined", "enabled": False}, 100)["enabled"])
         self.assertTrue(normalize({"schema": 1, "consent": "accepted", "enabled": True}, 100)["enabled"])
-        current = normalize({"schema": 3, "enabled": False}, 100)
+        current = normalize({"schema": 4, "enabled": False}, 100)
         self.assertFalse(current["enabled"])
         self.assertFalse(normalize({"schema": 2, "enabled": False}, 100)["enabled"])
+        self.assertFalse(normalize({"schema": 3, "enabled": False}, 100)["enabled"])
+        self.assertEqual(current["local_version"], "1.4.1")
+        self.assertEqual(current["features"], {"auto_updates": False})
+
+    def test_invalid_remote_version_does_not_discard_persistent_settings(self):
+        result = self.helpers["normalize_updater_settings"]({
+            "schema": 3,
+            "enabled": False,
+            "last_version": "invalid",
+            "startup_notice_version": "1.4.0",
+            "startup_notice_recipients_version": "1.4.0",
+            "startup_notice_recipients": [10, 20],
+        }, 100)
+        self.assertFalse(result["enabled"])
+        self.assertIsNone(result["last_version"])
+        self.assertEqual(result["startup_notice_version"], "1.4.0")
+        self.assertEqual(result["startup_notice_recipients"], [10, 20])
+
+    def test_updater_state_migrates_to_stable_cardinal_path_and_survives_restart(self):
+        load = self.helpers["load_updater_state"]
+        resolve_path = self.helpers["updater_settings_path"]
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plugin = root / "plugins" / "LotsManager.py"
+            plugin.parent.mkdir()
+            plugin.write_text("", encoding="utf-8")
+            legacy = root / "old-cwd" / "storage" / "plugins" / "lots_manager_updater.json"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text(json.dumps({
+                "schema": 3,
+                "enabled": False,
+                "startup_notice_version": "1.4.1",
+                "startup_notice_recipients_version": "1.4.1",
+                "startup_notice_recipients": [101, 202],
+            }), encoding="utf-8")
+
+            stable = resolve_path(plugin)
+            first = load(stable, 100, legacy)
+            second = load(stable, 101, root / "another-cwd" / "missing.json")
+
+            self.assertEqual(stable, (root / "storage" / "plugins" / "lots_manager_updater.json").resolve())
+            self.assertFalse(second["enabled"])
+            self.assertEqual(second["local_version"], "1.4.1")
+            self.assertEqual(second["features"], {"auto_updates": False})
+            self.assertEqual(second["startup_notice_version"], "1.4.1")
+            self.assertEqual(second["startup_notice_recipients"], [101, 202])
+            self.assertEqual(first, second)
+            self.assertEqual(json.loads(stable.read_text(encoding="utf-8")), second)
+
+    def test_malformed_updater_state_is_reset_durably(self):
+        load = self.helpers["load_or_reset_updater_state"]
+        with TemporaryDirectory() as temp_dir:
+            state_file = Path(temp_dir) / "storage" / "plugins" / "lots_manager_updater.json"
+            state_file.parent.mkdir(parents=True)
+            state_file.write_text("{broken", encoding="utf-8")
+            state = load(state_file, 100)
+            self.assertEqual(state["local_version"], "1.4.1")
+            self.assertTrue(state["enabled"])
+            self.assertEqual(json.loads(state_file.read_text(encoding="utf-8")), state)
 
     def test_candidate_first_valid_decision_wins_and_token_is_stale_safe(self):
         sha = "a" * 40
