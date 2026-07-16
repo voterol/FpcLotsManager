@@ -44,7 +44,7 @@ def load_helpers():
         "escape": escape, "isfinite": isfinite, "BeautifulSoup": BeautifulSoup,
         "urlparse": urlparse, "ast": ast, "re": re,
         "NAME": "LotsManager", "UUID": "5693f220-bcc6-4f6e-9745-9dee8664cbb2",
-        "UPDATER_OWNER": "voterol", "UPDATER_REPO": "users-voterol-fpc", "UPDATER_SOURCE_PATH": "LotsManager.py",
+        "UPDATER_OWNER": "voterol", "UPDATER_REPO": "FpcLotsManager", "UPDATER_SOURCE_PATH": "LotsManager.py",
     }
     module = ast.Module(body=selected, type_ignores=[])
     module.body.insert(0, ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0))
@@ -260,8 +260,8 @@ BIND_TO_DELETE = None
         build = self.helpers["build_update_urls"]
         sha = "a" * 40
         api_url, raw_url = build(sha)
-        self.assertEqual(api_url, "https://api.github.com/repos/voterol/users-voterol-fpc/commits?path=LotsManager.py&sha=main&per_page=1")
-        self.assertEqual(raw_url, f"https://raw.githubusercontent.com/voterol/users-voterol-fpc/{sha}/LotsManager.py")
+        self.assertEqual(api_url, "https://api.github.com/repos/voterol/FpcLotsManager/commits?path=LotsManager.py&sha=main&per_page=1")
+        self.assertEqual(raw_url, f"https://raw.githubusercontent.com/voterol/FpcLotsManager/{sha}/LotsManager.py")
         with self.assertRaises(ValueError):
             build("main")
 

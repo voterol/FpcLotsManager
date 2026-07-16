@@ -53,7 +53,7 @@ Runtime-данные создаются в `storage/plugins/` и `storage/cache/
 `storage/plugins/lots_manager_updater.json` и может быть изменён командой `/lots_update` или в меню настроек.
 
 Обновления загружаются только из публичного репозитория
-[`voterol/users-voterol-fpc`](https://github.com/voterol/users-voterol-fpc) по неизменяемому commit SHA. Плагин
+[`voterol/FpcLotsManager`](https://github.com/voterol/FpcLotsManager) по неизменяемому commit SHA. Плагин
 проверяет HTTPS-адрес, размер, синтаксис, `NAME`, `UUID` и версию файла, создаёт резервную копию и атомарно
 заменяет только собственный `.py`-файл. Новая версия начинает работать только после перезапуска Cardinal.
 
