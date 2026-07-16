@@ -60,6 +60,9 @@ HELPERS = {
     "load_or_reset_updater_state",
     "mutate_updater_state_file",
     "recover_failed_candidate_file",
+    "decide_candidate_file",
+    "claim_due_candidate_file",
+    "mark_candidate_prompted_file",
     "atomic_write_json",
 }
 
@@ -77,16 +80,17 @@ def load_helpers():
         "escape": escape, "isfinite": isfinite, "BeautifulSoup": BeautifulSoup,
         "urlparse": urlparse, "ast": ast, "re": re, "json": json, "Path": Path,
         "NamedTemporaryFile": NamedTemporaryFile, "replace": __import__("os").replace,
+        "time": __import__("time"),
         "NAME": "LotsManager", "UUID": "5693f220-bcc6-4f6e-9745-9dee8664cbb2",
         "UPDATER_OWNER": "voterol", "UPDATER_REPO": "FpcLotsManager", "UPDATER_SOURCE_PATH": "LotsManager.py",
         "UPDATER_VERSION_PATH": "VERSION", "UPDATER_SETTINGS_FILE": "storage/plugins/lots_manager_updater.json",
         "UPDATER_SETTINGS_SCHEMA": 4, "UPDATER_RESTART_DELAY": 3600,
-        "UPDATER_MAX_ACTIVATION_RESTARTS": 3, "VERSION": "1.4.3",
+        "UPDATER_MAX_ACTIVATION_RESTARTS": 3, "VERSION": "1.4.4",
         "UPDATER_STAGE_LABELS": {
             "waiting": "Ожидание следующей проверки", "check_failed": "Проверка обновлений не удалась",
         },
         "fcntl": None, "updater_file_fallback_lock": threading.RLock(),
-        "updater_settings": {"schema": 4, "local_version": "1.4.3", "enabled": True,
+        "updater_settings": {"schema": 4, "local_version": "1.4.4", "enabled": True,
                              "features": {"auto_updates": True}, "last_checked_at": 0, "last_commit": None,
                              "last_version": None, "startup_notice_version": None,
                              "startup_notice_recipients": [], "startup_notice_recipients_version": None,
@@ -389,7 +393,7 @@ BIND_TO_DELETE = None
         self.assertFalse(current["enabled"])
         self.assertFalse(normalize({"schema": 2, "enabled": False}, 100)["enabled"])
         self.assertFalse(normalize({"schema": 3, "enabled": False}, 100)["enabled"])
-        self.assertEqual(current["local_version"], "1.4.3")
+        self.assertEqual(current["local_version"], "1.4.4")
         self.assertEqual(current["features"], {"auto_updates": False})
 
     def test_invalid_remote_version_does_not_discard_persistent_settings(self):
@@ -430,7 +434,7 @@ BIND_TO_DELETE = None
 
             self.assertEqual(stable, (root / "storage" / "plugins" / "lots_manager_updater.json").resolve())
             self.assertFalse(second["enabled"])
-            self.assertEqual(second["local_version"], "1.4.3")
+            self.assertEqual(second["local_version"], "1.4.4")
             self.assertEqual(second["features"], {"auto_updates": False})
             self.assertEqual(second["startup_notice_version"], "1.4.2")
             self.assertEqual(second["startup_notice_recipients"], [101, 202])
@@ -444,7 +448,7 @@ BIND_TO_DELETE = None
             state_file.parent.mkdir(parents=True)
             state_file.write_text("{broken", encoding="utf-8")
             state = load(state_file, 100)
-            self.assertEqual(state["local_version"], "1.4.3")
+            self.assertEqual(state["local_version"], "1.4.4")
             self.assertTrue(state["enabled"])
             self.assertEqual(json.loads(state_file.read_text(encoding="utf-8")), state)
 
@@ -460,6 +464,57 @@ BIND_TO_DELETE = None
         self.assertEqual(decide(candidate, "b" * 12, "now", 200)[0], "stale")
         status, ignored = decide(candidate, sha[:12], "no", 200)
         self.assertEqual((status, ignored), ("ignored", None))
+
+    def test_durable_file_allows_only_one_candidate_install_claim(self):
+        decide = self.helpers["decide_candidate_file"]
+        mutate = self.helpers["mutate_updater_state_file"]
+        sha = "a" * 40
+        candidate = {"commit": sha, "version": "1.5.0", "token": sha[:12], "decision": None,
+                     "detected_at": 100, "deadline": 3700, "recipients": [1, 2], "prompted": [1, 2]}
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "updater.json"
+            mutate(path, 200, lambda state: state.update({"candidate": candidate}) or True)
+            barrier = threading.Barrier(3)
+            outcomes = []
+            def contender():
+                barrier.wait()
+                outcomes.append(decide(path, sha[:12], "now", 300)[1])
+            threads = [threading.Thread(target=contender) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            barrier.wait()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(sorted(outcomes), ["decided", "install"])
+            state, _, current = decide(path, sha[:12], "later", 301)
+            self.assertEqual(current["decision"], "installing")
+            self.assertEqual(state["candidate"]["decision"], "installing")
+
+    def test_stale_snapshot_cannot_roll_back_candidate_claim(self):
+        merge = self.helpers["merge_updater_snapshot"]
+        sha = "a" * 40
+        stale = self.helpers["default_updater_settings"]()
+        stale["candidate"] = {"commit": sha, "version": "1.5.0", "token": sha[:12], "decision": None,
+                              "detected_at": 100, "deadline": 3700, "recipients": [1], "prompted": []}
+        durable = json.loads(json.dumps(stale))
+        durable["candidate"].update({"decision": "installing", "deadline": 300})
+        merge(durable, stale)
+        self.assertEqual(durable["candidate"]["decision"], "installing")
+
+    def test_due_candidate_has_one_durable_claimant(self):
+        claim = self.helpers["claim_due_candidate_file"]
+        mutate = self.helpers["mutate_updater_state_file"]
+        sha = "a" * 40
+        candidate = {"commit": sha, "version": "1.5.0", "token": sha[:12], "decision": "later",
+                     "detected_at": 100, "deadline": 200, "recipients": [1], "prompted": [1]}
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "updater.json"
+            mutate(path, 100, lambda state: state.update({"candidate": candidate}) or True)
+            self.assertTrue(claim(path, sha[:12], 300)[1])
+            state, claimed, current = claim(path, sha[:12], 300)
+            self.assertFalse(claimed)
+            self.assertEqual(current["decision"], "installing")
+            self.assertEqual(state["candidate"]["decision"], "installing")
 
     def test_disable_cancels_pending_candidate_but_keeps_claimed_install(self):
         sha = "a" * 40
@@ -481,8 +536,11 @@ BIND_TO_DELETE = None
         self.assertEqual(status, "retryable")
         self.assertIsNone(recovered["decision"])
         self.assertEqual(recovered["deadline"], 3900)
+        self.assertEqual(recovered["prompted"], [])
+        self.assertEqual(recovered["recipients"], [1, 2])
         self.assertEqual((recovered["commit"], recovered["token"]), (sha, sha[:12]))
         self.assertEqual(candidate["decision"], "installing")
+        self.assertEqual(candidate["prompted"], [1])
         transition, retried = self.helpers["candidate_decision"](recovered, sha[:12], "now", 301)
         self.assertEqual(transition, "install")
         self.assertEqual(retried["decision"], "installing")
@@ -491,25 +549,29 @@ BIND_TO_DELETE = None
         sha = "a" * 40
         recover = self.helpers["candidate_after_install_failure"]
         candidate = {"commit": sha, "version": "1.5.0", "token": sha[:12], "decision": "installing",
-                     "detected_at": 100, "deadline": 200, "recipients": [], "prompted": []}
-        self.assertEqual(recover(candidate, "b" * 12, 300)[0], "stale")
+                     "detected_at": 100, "deadline": 200, "recipients": [], "prompted": [1]}
+        status, stale = recover(candidate, "b" * 12, 300)
+        self.assertEqual(status, "stale")
+        self.assertEqual(stale["prompted"], [1])
         for decision in (None, "later"):
             status, unchanged = recover({**candidate, "decision": decision}, sha[:12], 300)
             self.assertEqual(status, "unchanged")
             self.assertEqual(unchanged["decision"], decision)
+            self.assertEqual(unchanged["prompted"], [1])
 
     def test_failed_install_recovery_uses_current_durable_candidate(self):
         recover = self.helpers["recover_failed_candidate_file"]
         mutate = self.helpers["mutate_updater_state_file"]
         sha = "a" * 40
         candidate = {"commit": sha, "version": "1.5.0", "token": sha[:12], "decision": "installing",
-                     "detected_at": 100, "deadline": 200, "recipients": [], "prompted": []}
+                     "detected_at": 100, "deadline": 200, "recipients": [1], "prompted": [1]}
         with TemporaryDirectory() as directory:
             path = Path(directory) / "updater.json"
             mutate(path, 200, lambda state: state.update({"candidate": candidate}) or True)
             state, status, recovered = recover(path, sha[:12], 300)
             self.assertEqual(status, "retryable")
             self.assertIsNone(recovered["decision"])
+            self.assertEqual(recovered["prompted"], [])
             self.assertEqual(state["candidate"], recovered)
             mutate(path, 301, lambda state: state.update({"candidate": None}) or True)
             state, status, recovered = recover(path, sha[:12], 302)
