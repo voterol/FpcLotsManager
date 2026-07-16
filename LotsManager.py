@@ -40,7 +40,7 @@ except ImportError:  # Windows Cardinal installations use the in-process fallbac
 
 
 NAME = "LotsManager"
-VERSION = "1.4.5"
+VERSION = "1.4.6"
 DESCRIPTION = "Плагин для копирования и управления лотами через inline кнопки."
 CREDITS = "@woopertail, @sidor0912, @voterol (gpt5.6-sol)"
 UUID = "5693f220-bcc6-4f6e-9745-9dee8664cbb2"
@@ -355,7 +355,7 @@ def startup_notice_plan(snapshot, successful_recipients) -> tuple[tuple[int, ...
 def build_update_urls(commit_sha: str) -> tuple[str, str, str]:
     if not re.fullmatch(r"[0-9a-f]{40}", str(commit_sha or "")):
         raise ValueError("invalid GitHub commit")
-    api_url = f"https://api.github.com/repos/{UPDATER_OWNER}/{UPDATER_REPO}/commits?path={UPDATER_VERSION_PATH}&sha=main&per_page=1"
+    api_url = f"https://api.github.com/repos/{UPDATER_OWNER}/{UPDATER_REPO}/commits/main"
     base = f"https://raw.githubusercontent.com/{UPDATER_OWNER}/{UPDATER_REPO}/{commit_sha}"
     return api_url, f"{base}/{UPDATER_VERSION_PATH}", f"{base}/{UPDATER_SOURCE_PATH}"
 
@@ -1388,10 +1388,10 @@ def init_commands(cardinal: Cardinal):
 
     def resolve_version_commit(remote_version: str) -> str:
         api_url, _, _ = build_update_urls("0" * 40)
-        commits = fetch_limited_json(api_url)
-        if not isinstance(commits, list) or not commits or not isinstance(commits[0], dict):
-            raise RuntimeError("GitHub не вернул commit VERSION")
-        commit_sha = str(commits[0].get("sha") or "")
+        commit = fetch_limited_json(api_url)
+        if not isinstance(commit, dict):
+            raise RuntimeError("GitHub не вернул HEAD main")
+        commit_sha = str(commit.get("sha") or "")
         _, version_url, _ = build_update_urls(commit_sha)
         if parse_version_document(fetch_limited_source(version_url, 128)) != remote_version:
             raise RuntimeError("VERSION изменился во время разрешения commit; повторите проверку")

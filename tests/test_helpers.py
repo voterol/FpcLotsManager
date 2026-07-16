@@ -85,12 +85,12 @@ def load_helpers():
         "UPDATER_OWNER": "voterol", "UPDATER_REPO": "FpcLotsManager", "UPDATER_SOURCE_PATH": "LotsManager.py",
         "UPDATER_VERSION_PATH": "VERSION", "UPDATER_SETTINGS_FILE": "storage/plugins/lots_manager_updater.json",
         "UPDATER_SETTINGS_SCHEMA": 4, "UPDATER_RESTART_DELAY": 3600,
-        "UPDATER_MAX_ACTIVATION_RESTARTS": 3, "VERSION": "1.4.5",
+        "UPDATER_MAX_ACTIVATION_RESTARTS": 3, "VERSION": "1.4.6",
         "UPDATER_STAGE_LABELS": {
             "waiting": "Ожидание следующей проверки", "check_failed": "Проверка обновлений не удалась",
         },
         "fcntl": None, "updater_file_fallback_lock": threading.RLock(),
-        "updater_settings": {"schema": 4, "local_version": "1.4.5", "enabled": True,
+        "updater_settings": {"schema": 4, "local_version": "1.4.6", "enabled": True,
                              "features": {"auto_updates": True}, "last_checked_at": 0, "last_commit": None,
                              "last_version": None, "startup_notice_version": None,
                              "startup_notice_recipients": [], "startup_notice_recipients_version": None,
@@ -377,7 +377,8 @@ BIND_TO_DELETE = None
         build = self.helpers["build_update_urls"]
         sha = "a" * 40
         api_url, version_url, source_url = build(sha)
-        self.assertEqual(api_url, "https://api.github.com/repos/voterol/FpcLotsManager/commits?path=VERSION&sha=main&per_page=1")
+        self.assertEqual(api_url, "https://api.github.com/repos/voterol/FpcLotsManager/commits/main")
+        self.assertNotIn("path=VERSION", api_url)
         self.assertEqual(version_url, f"https://raw.githubusercontent.com/voterol/FpcLotsManager/{sha}/VERSION")
         self.assertEqual(source_url, f"https://raw.githubusercontent.com/voterol/FpcLotsManager/{sha}/LotsManager.py")
         with self.assertRaises(ValueError):
@@ -393,7 +394,7 @@ BIND_TO_DELETE = None
         self.assertFalse(current["enabled"])
         self.assertFalse(normalize({"schema": 2, "enabled": False}, 100)["enabled"])
         self.assertFalse(normalize({"schema": 3, "enabled": False}, 100)["enabled"])
-        self.assertEqual(current["local_version"], "1.4.5")
+        self.assertEqual(current["local_version"], "1.4.6")
         self.assertEqual(current["features"], {"auto_updates": False})
 
     def test_invalid_remote_version_does_not_discard_persistent_settings(self):
@@ -434,7 +435,7 @@ BIND_TO_DELETE = None
 
             self.assertEqual(stable, (root / "storage" / "plugins" / "lots_manager_updater.json").resolve())
             self.assertFalse(second["enabled"])
-            self.assertEqual(second["local_version"], "1.4.5")
+            self.assertEqual(second["local_version"], "1.4.6")
             self.assertEqual(second["features"], {"auto_updates": False})
             self.assertEqual(second["startup_notice_version"], "1.4.2")
             self.assertEqual(second["startup_notice_recipients"], [101, 202])
@@ -448,7 +449,7 @@ BIND_TO_DELETE = None
             state_file.parent.mkdir(parents=True)
             state_file.write_text("{broken", encoding="utf-8")
             state = load(state_file, 100)
-            self.assertEqual(state["local_version"], "1.4.5")
+            self.assertEqual(state["local_version"], "1.4.6")
             self.assertTrue(state["enabled"])
             self.assertEqual(json.loads(state_file.read_text(encoding="utf-8")), state)
 
