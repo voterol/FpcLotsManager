@@ -33,9 +33,14 @@ from Utils import cardinal_tools
 import time
 import json
 
+try:
+    import fcntl
+except ImportError:  # Windows Cardinal installations use the in-process fallback.
+    fcntl = None
+
 
 NAME = "LotsManager"
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 DESCRIPTION = "Плагин для копирования и управления лотами через inline кнопки."
 CREDITS = "@woopertail, @sidor0912, @voterol (gpt5.6-sol)"
 UUID = "5693f220-bcc6-4f6e-9745-9dee8664cbb2"
@@ -61,6 +66,7 @@ UPDATER_CB_STARTUP_SKIP = "lm_upd_startup_skip"
 UPDATER_CB_RESTART_NOW = "lm_upd_restart_now"
 UPDATER_CB_DECIDE = "lmud"
 UPDATER_RESTART_DELAY = 60 * 60
+UPDATER_MAX_ACTIVATION_RESTARTS = 3
 
 
 # Callback'и для копирования
@@ -170,6 +176,10 @@ updater_lock = threading.RLock()
 updater_prompt_lock = threading.Lock()
 restart_lock = threading.Lock()
 restart_requested = False
+activation_timers = set()
+activation_lifecycle_lock = threading.RLock()
+activation_shutdown = threading.Event()
+updater_file_fallback_lock = threading.RLock()
 
 
 def default_updater_settings() -> dict:
@@ -189,6 +199,7 @@ def default_updater_settings() -> dict:
         "ignored_commits": [],
         "install_notice": None,
         "pending_activation": None,
+        "completed_activations": [],
     }
 
 
@@ -418,6 +429,41 @@ def activation_after_start(value, running_version: str) -> tuple[dict | None, bo
     return (None, True) if activated else (pending, False)
 
 
+def activation_restart_allowed(value, running_version: str, max_attempts: int = UPDATER_MAX_ACTIVATION_RESTARTS) -> bool:
+    """Bound automatic restarts and stop once the installed version is active."""
+    pending = normalize_pending_activation(value)
+    return bool(
+        pending
+        and version_tuple(running_version) < version_tuple(pending["to_version"])
+        and pending["restart_attempts"] < max_attempts
+    )
+
+
+def claim_activation_restart(state: dict, running_version: str, now: int) -> bool:
+    """Durably consume one bounded restart attempt before invoking process restart."""
+    pending = normalize_pending_activation(state.get("pending_activation"))
+    if not activation_restart_allowed(pending, running_version) or now < pending["next_retry_at"]:
+        return False
+    pending["restart_attempts"] += 1
+    backoff = min(300, 5 * (2 ** min(pending["restart_attempts"] - 1, 6)))
+    pending["next_retry_at"] = now + backoff
+    state["pending_activation"] = pending
+    return True
+
+
+def cancel_updater_timers(cardinal=None, call=None):
+    """Cancel timers owned by this module generation before plugin removal/reload."""
+    activation_shutdown.set()
+    with activation_lifecycle_lock:
+        for timer in tuple(activation_timers):
+            try:
+                timer.cancel()
+            except Exception:
+                logger.debug("[LOTS UPDATER] Не удалось отменить activation timer.", exc_info=True)
+            finally:
+                activation_timers.discard(timer)
+
+
 def recover_candidate_for_running_version(candidate, notice, running_version: str, now: int) -> tuple[dict | None, dict | None, str]:
     """Reconcile a replacement that completed before the old process crashed/restarted."""
     current = normalize_update_candidate(candidate, now)
@@ -468,9 +514,45 @@ def normalize_updater_settings(loaded, now: int) -> dict:
     ))[-20:] if isinstance(ignored, list) else []
     result["install_notice"] = normalize_install_notice(loaded.get("install_notice"))
     result["pending_activation"] = normalize_pending_activation(loaded.get("pending_activation"))
+    completed = loaded.get("completed_activations")
+    result["completed_activations"] = list(dict.fromkeys(
+        item for item in completed if isinstance(item, str) and re.fullmatch(r"[0-9a-f]{40}", item)
+    ))[-20:] if isinstance(completed, list) else []
+    pending_activation = result["pending_activation"]
+    if pending_activation and pending_activation["commit"] in result["completed_activations"]:
+        result["pending_activation"] = None
     result["local_version"] = VERSION
     result["features"] = {"auto_updates": result["enabled"]}
     return result
+
+
+def merge_updater_snapshot(durable: dict, snapshot: dict) -> bool:
+    """Merge a module snapshot without rolling back durable activation progress."""
+    completed = list(dict.fromkeys(
+        list(durable.get("completed_activations") or [])
+        + list(snapshot.get("completed_activations") or [])
+    ))[-20:]
+    durable_pending = normalize_pending_activation(durable.get("pending_activation"))
+    snapshot_pending = normalize_pending_activation(snapshot.get("pending_activation"))
+    if snapshot_pending and snapshot_pending["commit"] in completed:
+        snapshot_pending = None
+    if (durable_pending and snapshot_pending is None
+            and durable_pending["commit"] not in completed):
+        snapshot_pending = durable_pending
+    if durable_pending and snapshot_pending:
+        if durable_pending["commit"] == snapshot_pending["commit"]:
+            snapshot_pending["restart_attempts"] = max(
+                durable_pending["restart_attempts"], snapshot_pending["restart_attempts"])
+            snapshot_pending["next_retry_at"] = max(
+                durable_pending["next_retry_at"], snapshot_pending["next_retry_at"])
+        else:
+            # A stale module generation cannot replace a newer durable activation.
+            snapshot_pending = durable_pending
+    snapshot["pending_activation"] = snapshot_pending
+    snapshot["completed_activations"] = completed
+    durable.clear()
+    durable.update(snapshot)
+    return True
 
 
 def updater_settings_path(plugin_path: str | Path) -> Path:
@@ -508,6 +590,27 @@ def load_or_reset_updater_state(file_path: str | Path, now: int, legacy_path: st
         return normalized
 
 
+def mutate_updater_state_file(file_path: str | Path, now: int, mutator,
+                              legacy_path: str | Path | None = None) -> tuple[dict, bool]:
+    """Serialize updater state changes across module generations and Cardinal processes."""
+    path = Path(file_path)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with updater_file_fallback_lock, lock_path.open("a+", encoding="utf-8") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            state = load_or_reset_updater_state(path, now, legacy_path=legacy_path)
+            changed = bool(mutator(state))
+            if changed:
+                state = normalize_updater_settings(state, now)
+                atomic_write_json(path, state)
+            return state, changed
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def fetch_published_version() -> str:
     """Fetch the small public VERSION document without downloading executable code."""
     request = Request(UPDATER_VERSION_URL, headers={"Accept": "text/plain", "User-Agent": "LotsManager-Updater"})
@@ -524,11 +627,19 @@ def schedule_headless_version_checks(updater_file: str | Path) -> None:
     """Persist startup/hourly comparisons when Cardinal runs without Telegram."""
     def tick():
         try:
+            now = int(time.time())
             with updater_lock:
-                state = load_or_reset_updater_state(updater_file, int(time.time()), legacy_path=UPDATER_SETTINGS_FILE)
+                state, _ = mutate_updater_state_file(
+                    updater_file, now, lambda current: True, legacy_path=UPDATER_SETTINGS_FILE)
                 state["last_version"] = fetch_published_version()
                 state["last_checked_at"] = int(time.time())
-                atomic_write_json(updater_file, normalize_updater_settings(state, int(time.time())))
+                state, _ = mutate_updater_state_file(
+                    updater_file, int(time.time()),
+                    lambda durable: durable.update({
+                        "last_version": state["last_version"],
+                        "last_checked_at": state["last_checked_at"],
+                    }) or True,
+                )
         except Exception:
             logger.error("[LOTS UPDATER] Headless VERSION check failed.", exc_info=True)
         finally:
@@ -916,7 +1027,8 @@ def init_commands(cardinal: Cardinal):
     updater_file = updater_settings_path(__file__)
     if not cardinal.telegram:
         try:
-            state = load_or_reset_updater_state(updater_file, int(time.time()), legacy_path=UPDATER_SETTINGS_FILE)
+            state, _ = mutate_updater_state_file(
+                updater_file, int(time.time()), lambda current: True, legacy_path=UPDATER_SETTINGS_FILE)
             with updater_lock:
                 updater_settings.clear()
                 updater_settings.update(state)
@@ -933,23 +1045,20 @@ def init_commands(cardinal: Cardinal):
 
     def load_updater_settings():
         try:
-            loaded = load_updater_state(
+            loaded, _ = mutate_updater_state_file(
                 updater_file,
                 int(time.time()),
+                lambda current: True,
                 legacy_path=UPDATER_SETTINGS_FILE,
             )
             with updater_lock:
                 updater_settings.clear()
                 updater_settings.update(loaded)
-        except (OSError, ValueError, json.JSONDecodeError):
+        except OSError:
             logger.error("[LOTS UPDATER] Настройки повреждены; используются значения по умолчанию.")
             with updater_lock:
                 updater_settings.clear()
                 updater_settings.update(normalize_updater_settings({}, int(time.time())))
-                try:
-                    atomic_write_json(updater_file, dict(updater_settings))
-                except OSError:
-                    logger.error("[LOTS UPDATER] Не удалось сохранить настройки по умолчанию.", exc_info=True)
 
     def persistent_updater_snapshot() -> dict:
         snapshot = dict(updater_settings)
@@ -961,7 +1070,12 @@ def init_commands(cardinal: Cardinal):
     def save_updater_settings():
         with updater_lock:
             updater_settings.update(persistent_updater_snapshot())
-            atomic_write_json(updater_file, dict(updater_settings))
+            saved, _ = mutate_updater_state_file(
+                updater_file, int(time.time()),
+                lambda durable: merge_updater_snapshot(durable, dict(updater_settings)),
+            )
+            updater_settings.clear()
+            updater_settings.update(saved)
 
     def settings_snapshot() -> dict:
         with updater_lock:
@@ -972,8 +1086,13 @@ def init_commands(cardinal: Cardinal):
         with updater_lock:
             mutator(updater_settings)
             updater_settings.update(persistent_updater_snapshot())
-            atomic_write_json(updater_file, dict(updater_settings))
-            return dict(updater_settings)
+            saved, _ = mutate_updater_state_file(
+                updater_file, int(time.time()),
+                lambda durable: merge_updater_snapshot(durable, dict(updater_settings)),
+            )
+            updater_settings.clear()
+            updater_settings.update(saved)
+            return dict(saved)
 
     def authorized_user_ids() -> tuple[int, ...]:
         result = []
@@ -1240,44 +1359,58 @@ def init_commands(cardinal: Cardinal):
     activation_timer_state = {"timer": None}
 
     def schedule_activation_restart(delay: int = 0):
-        old = activation_timer_state.get("timer")
-        if old:
-            old.cancel()
+        if activation_shutdown.is_set():
+            return
+        with activation_lifecycle_lock:
+            if activation_shutdown.is_set():
+                return
+            old = activation_timer_state.get("timer")
+            if old:
+                old.cancel()
+                activation_timers.discard(old)
         def attempt():
-            pending = normalize_pending_activation(settings_snapshot().get("pending_activation"))
-            if pending is None:
+            if activation_shutdown.is_set():
                 return
             now = int(time.time())
-            if now < pending["next_retry_at"]:
-                schedule_activation_restart(pending["next_retry_at"] - now)
+            try:
+                durable, claimed = mutate_updater_state_file(
+                    updater_file, now,
+                    lambda state: claim_activation_restart(state, VERSION, now),
+                )
+            except OSError:
+                logger.error("[LOTS UPDATER] Не удалось claim activation restart; повтор через минуту.", exc_info=True)
+                schedule_activation_restart(60)
                 return
-            failed = False
+            pending = normalize_pending_activation(durable.get("pending_activation"))
+            if not claimed:
+                if pending and version_tuple(VERSION) < version_tuple(pending["to_version"]):
+                    if pending["restart_attempts"] >= UPDATER_MAX_ACTIVATION_RESTARTS:
+                        logger.error("[LOTS UPDATER] Достигнут лимит автоматических restart; требуется ручная проверка.")
+                    elif now < pending["next_retry_at"]:
+                        schedule_activation_restart(pending["next_retry_at"] - now)
+                return
+            with updater_lock:
+                updater_settings.clear()
+                updater_settings.update(durable)
+            with activation_lifecycle_lock:
+                if activation_shutdown.is_set():
+                    return
             try:
                 cardinal_tools.restart_program()
-                # A successful restart normally terminates this process. Returning means activation
-                # is not yet proven, so retain durable state and arm a watchdog retry.
             except Exception:
-                failed = True
                 logger.error("[LOTS UPDATER] Restart после установки не удался.", exc_info=True)
-            def record_retry(state):
-                current = normalize_pending_activation(state.get("pending_activation"))
-                if current is None or current["commit"] != pending["commit"]:
-                    return
-                current["restart_attempts"] += 1
-                backoff = min(300, 5 * (2 ** min(current["restart_attempts"] - 1, 6)))
-                current["next_retry_at"] = int(time.time()) + backoff
-                state["pending_activation"] = current
-            snapshot = mutate_updater_settings(record_retry)
-            current = normalize_pending_activation(snapshot.get("pending_activation"))
-            if current:
-                if not failed:
-                    logger.warning("[LOTS UPDATER] restart_program вернулся без доказанной активации; запланирован retry.")
-                schedule_activation_restart(max(1, current["next_retry_at"] - int(time.time())))
+            if not activation_shutdown.is_set():
+                logger.warning("[LOTS UPDATER] restart_program вернулся; activation будет перепроверена перед retry.")
+                schedule_activation_restart(max(1, pending["next_retry_at"] - int(time.time())))
         timer = threading.Timer(max(0, delay), attempt)
         timer.name = "LotsManagerActivationRestart"
         timer.daemon = True
-        activation_timer_state["timer"] = timer
-        timer.start()
+        with activation_lifecycle_lock:
+            if activation_shutdown.is_set():
+                return
+            activation_timer_state["timer"] = timer
+            activation_timers.add(timer)
+            timer.start()
 
     def restart_after_install():
         # install_notice and pending_activation are durable already; Telegram cannot delay restart.
@@ -1386,7 +1519,14 @@ def init_commands(cardinal: Cardinal):
     pending_activation, activation_proven = activation_after_start(
         settings_snapshot().get("pending_activation"), VERSION)
     if activation_proven:
-        mutate_updater_settings(lambda state: state.__setitem__("pending_activation", None))
+        def complete_activation(state):
+            current = normalize_pending_activation(state.get("pending_activation"))
+            if current:
+                state["completed_activations"] = list(dict.fromkeys(
+                    state.get("completed_activations", []) + [current["commit"]]
+                ))[-20:]
+            state["pending_activation"] = None
+        mutate_updater_settings(complete_activation)
     elif pending_activation:
         schedule_activation_restart(max(0, pending_activation["next_retry_at"] - int(time.time())))
     recovered_candidate, recovered_notice, recovery_status = recover_candidate_for_running_version(
@@ -1435,14 +1575,16 @@ def init_commands(cardinal: Cardinal):
         if not restart_lock.acquire(blocking=False):
             return
         try:
-            pending = normalize_pending_restart(updater_settings.get("pending_restart"))
-            current_token = pending_restart_token(pending)
-            if (restart_requested or not pending_restart_is_actionable(pending, VERSION) or
-                    (expected_token is not None and expected_token != current_token) or
-                    (expected_token is not None and int(time.time()) < pending["deadline"])):
-                return
-            # Keep the deadline persisted until the new version starts; the in-process flag makes calls idempotent.
-            restart_requested = True
+            with activation_lifecycle_lock:
+                pending = normalize_pending_restart(updater_settings.get("pending_restart"))
+                current_token = pending_restart_token(pending)
+                if (activation_shutdown.is_set() or restart_requested
+                        or not pending_restart_is_actionable(pending, VERSION)
+                        or (expected_token is not None and expected_token != current_token)
+                        or (expected_token is not None and int(time.time()) < pending["deadline"])):
+                    return
+                # Keep the deadline persisted until the new version starts; the in-process flag makes calls idempotent.
+                restart_requested = True
             cardinal_tools.restart_program()
         except Exception:
             restart_requested = False
@@ -6032,4 +6174,4 @@ def init_commands(cardinal: Cardinal):
 
 
 BIND_TO_PRE_INIT = [init_commands]
-BIND_TO_DELETE = None
+BIND_TO_DELETE = cancel_updater_timers

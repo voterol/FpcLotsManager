@@ -2,6 +2,7 @@ import unittest
 import ast
 import json
 import re
+import threading
 from html import escape
 from math import isfinite
 from pathlib import Path
@@ -46,12 +47,16 @@ HELPERS = {
     "normalize_install_notice",
     "normalize_pending_activation",
     "activation_after_start",
+    "activation_restart_allowed",
+    "claim_activation_restart",
     "recover_candidate_for_running_version",
     "default_updater_settings",
     "normalize_updater_settings",
+    "merge_updater_snapshot",
     "updater_settings_path",
     "load_updater_state",
     "load_or_reset_updater_state",
+    "mutate_updater_state_file",
     "atomic_write_json",
 }
 
@@ -72,13 +77,15 @@ def load_helpers():
         "NAME": "LotsManager", "UUID": "5693f220-bcc6-4f6e-9745-9dee8664cbb2",
         "UPDATER_OWNER": "voterol", "UPDATER_REPO": "FpcLotsManager", "UPDATER_SOURCE_PATH": "LotsManager.py",
         "UPDATER_VERSION_PATH": "VERSION", "UPDATER_SETTINGS_FILE": "storage/plugins/lots_manager_updater.json",
-        "UPDATER_SETTINGS_SCHEMA": 4, "UPDATER_RESTART_DELAY": 3600, "VERSION": "1.4.1",
-        "updater_settings": {"schema": 4, "local_version": "1.4.1", "enabled": True,
+        "UPDATER_SETTINGS_SCHEMA": 4, "UPDATER_RESTART_DELAY": 3600,
+        "UPDATER_MAX_ACTIVATION_RESTARTS": 3, "VERSION": "1.4.2",
+        "fcntl": None, "updater_file_fallback_lock": threading.RLock(),
+        "updater_settings": {"schema": 4, "local_version": "1.4.2", "enabled": True,
                              "features": {"auto_updates": True}, "last_checked_at": 0, "last_commit": None,
                              "last_version": None, "startup_notice_version": None,
                              "startup_notice_recipients": [], "startup_notice_recipients_version": None,
                              "pending_restart": None, "candidate": None, "ignored_commits": [], "install_notice": None,
-                             "pending_activation": None},
+                             "pending_activation": None, "completed_activations": []},
     }
     module = ast.Module(body=selected, type_ignores=[])
     module.body.insert(0, ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0))
@@ -359,7 +366,7 @@ BIND_TO_DELETE = None
         self.assertFalse(current["enabled"])
         self.assertFalse(normalize({"schema": 2, "enabled": False}, 100)["enabled"])
         self.assertFalse(normalize({"schema": 3, "enabled": False}, 100)["enabled"])
-        self.assertEqual(current["local_version"], "1.4.1")
+        self.assertEqual(current["local_version"], "1.4.2")
         self.assertEqual(current["features"], {"auto_updates": False})
 
     def test_invalid_remote_version_does_not_discard_persistent_settings(self):
@@ -389,8 +396,8 @@ BIND_TO_DELETE = None
             legacy.write_text(json.dumps({
                 "schema": 3,
                 "enabled": False,
-                "startup_notice_version": "1.4.1",
-                "startup_notice_recipients_version": "1.4.1",
+                "startup_notice_version": "1.4.2",
+                "startup_notice_recipients_version": "1.4.2",
                 "startup_notice_recipients": [101, 202],
             }), encoding="utf-8")
 
@@ -400,9 +407,9 @@ BIND_TO_DELETE = None
 
             self.assertEqual(stable, (root / "storage" / "plugins" / "lots_manager_updater.json").resolve())
             self.assertFalse(second["enabled"])
-            self.assertEqual(second["local_version"], "1.4.1")
+            self.assertEqual(second["local_version"], "1.4.2")
             self.assertEqual(second["features"], {"auto_updates": False})
-            self.assertEqual(second["startup_notice_version"], "1.4.1")
+            self.assertEqual(second["startup_notice_version"], "1.4.2")
             self.assertEqual(second["startup_notice_recipients"], [101, 202])
             self.assertEqual(first, second)
             self.assertEqual(json.loads(stable.read_text(encoding="utf-8")), second)
@@ -414,7 +421,7 @@ BIND_TO_DELETE = None
             state_file.parent.mkdir(parents=True)
             state_file.write_text("{broken", encoding="utf-8")
             state = load(state_file, 100)
-            self.assertEqual(state["local_version"], "1.4.1")
+            self.assertEqual(state["local_version"], "1.4.2")
             self.assertTrue(state["enabled"])
             self.assertEqual(json.loads(state_file.read_text(encoding="utf-8")), state)
 
@@ -482,6 +489,98 @@ BIND_TO_DELETE = None
         self.assertEqual(transition(pending, "1.5.0"), (None, True))
         self.assertEqual(transition(pending, "1.6.0"), (None, True))
         self.assertIsNone(self.helpers["normalize_pending_activation"]({**pending, "restart_attempts": True}))
+
+    def test_activation_restart_stops_for_active_version_and_at_attempt_limit(self):
+        pending = {"commit": "a" * 40, "from_version": "1.4.0", "to_version": "1.4.2",
+                   "installed_at": 100, "restart_attempts": 0, "next_retry_at": 100}
+        allowed = self.helpers["activation_restart_allowed"]
+        self.assertTrue(allowed(pending, "1.4.1"))
+        self.assertFalse(allowed(pending, "1.4.2"))
+        self.assertFalse(allowed(pending, "1.5.0"))
+        self.assertTrue(allowed({**pending, "restart_attempts": 2}, "1.4.1"))
+        self.assertFalse(allowed({**pending, "restart_attempts": 3}, "1.4.1"))
+
+    def test_activation_restart_attempt_is_claimed_before_restart(self):
+        state = {"pending_activation": {
+            "commit": "a" * 40, "from_version": "1.4.0", "to_version": "1.4.2",
+            "installed_at": 100, "restart_attempts": 0, "next_retry_at": 100,
+        }}
+        claim = self.helpers["claim_activation_restart"]
+        self.assertTrue(claim(state, "1.4.1", 100))
+        self.assertEqual(state["pending_activation"]["restart_attempts"], 1)
+        self.assertEqual(state["pending_activation"]["next_retry_at"], 105)
+        state["pending_activation"]["restart_attempts"] = 3
+        self.assertFalse(claim(state, "1.4.1", 200))
+        self.assertEqual(state["pending_activation"]["restart_attempts"], 3)
+        self.assertFalse(claim(state, "1.4.2", 200))
+
+    def test_stale_snapshot_cannot_resurrect_completed_activation(self):
+        commit = "a" * 40
+        durable = self.helpers["normalize_updater_settings"]({
+            "pending_activation": None, "completed_activations": [commit],
+        }, 200)
+        stale = self.helpers["normalize_updater_settings"]({
+            "pending_activation": {
+                "commit": commit, "from_version": "1.4.1", "to_version": "1.4.2",
+                "installed_at": 100, "restart_attempts": 0, "next_retry_at": 100,
+            },
+        }, 200)
+        self.helpers["merge_updater_snapshot"](durable, stale)
+        result = self.helpers["normalize_updater_settings"](durable, 200)
+        self.assertIsNone(result["pending_activation"])
+        self.assertEqual(result["completed_activations"], [commit])
+
+    def test_stale_snapshot_cannot_roll_back_activation_claim(self):
+        commit = "a" * 40
+        pending = {
+            "commit": commit, "from_version": "1.4.1", "to_version": "1.4.2",
+            "installed_at": 100, "restart_attempts": 2, "next_retry_at": 130,
+        }
+        durable = self.helpers["normalize_updater_settings"]({"pending_activation": pending}, 200)
+        stale = self.helpers["normalize_updater_settings"]({
+            "pending_activation": {**pending, "restart_attempts": 0, "next_retry_at": 100},
+        }, 200)
+        self.helpers["merge_updater_snapshot"](durable, stale)
+        self.assertEqual(durable["pending_activation"]["restart_attempts"], 2)
+        self.assertEqual(durable["pending_activation"]["next_retry_at"], 130)
+
+    def test_stale_empty_snapshot_cannot_erase_durable_activation(self):
+        commit = "a" * 40
+        pending = {
+            "commit": commit, "from_version": "1.4.1", "to_version": "1.4.2",
+            "installed_at": 100, "restart_attempts": 1, "next_retry_at": 105,
+        }
+        durable = self.helpers["normalize_updater_settings"]({"pending_activation": pending}, 200)
+        stale = self.helpers["normalize_updater_settings"]({"pending_activation": None}, 200)
+        self.helpers["merge_updater_snapshot"](durable, stale)
+        self.assertEqual(durable["pending_activation"], pending)
+
+    def test_durable_file_allows_only_one_activation_restart_claim(self):
+        mutate = self.helpers["mutate_updater_state_file"]
+        claim = self.helpers["claim_activation_restart"]
+        commit = "a" * 40
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "updater.json"
+            mutate(path, 100, lambda state: state.update({"pending_activation": {
+                "commit": commit, "from_version": "1.4.1", "to_version": "1.4.2",
+                "installed_at": 100, "restart_attempts": 0, "next_retry_at": 100,
+            }}) or True)
+            barrier = threading.Barrier(2)
+            results = []
+            def contender():
+                barrier.wait()
+                _, changed = mutate(path, 100, lambda state: claim(state, "1.4.1", 100))
+                results.append(changed)
+            threads = [threading.Thread(target=contender) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(2)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(sorted(results), [False, True])
+            state, _ = mutate(path, 100, lambda current: False)
+            self.assertEqual(state["pending_activation"]["restart_attempts"], 1)
+            self.assertEqual(state["pending_activation"]["next_retry_at"], 105)
 
     def test_pending_restart_validation_is_strict_and_forward_only(self):
         normalize = self.helpers["normalize_pending_restart"]
