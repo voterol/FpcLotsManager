@@ -29,12 +29,13 @@ from FunPayAPI.account import Account
 from logging import getLogger
 from telebot.types import Message
 from tg_bot import static_keyboards as skb
+from Utils import cardinal_tools
 import time
 import json
 
 
 NAME = "LotsManager"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DESCRIPTION = "Плагин для копирования и управления лотами через inline кнопки."
 CREDITS = "@woopertail, @sidor0912, @voterol (gpt5.6-sol)"
 UUID = "5693f220-bcc6-4f6e-9745-9dee8664cbb2"
@@ -48,12 +49,16 @@ UPDATER_SETTINGS_FILE = "storage/plugins/lots_manager_updater.json"
 UPDATER_OWNER = "voterol"
 UPDATER_REPO = "FpcLotsManager"
 UPDATER_SOURCE_PATH = "LotsManager.py"
+UPDATER_VERSION_PATH = "VERSION"
 UPDATER_CHECK_INTERVAL = 6 * 60 * 60
 UPDATER_MAX_BYTES = 2 * 1024 * 1024
-UPDATER_CONSENT_FINGERPRINT = "v1:github:voterol/FpcLotsManager:main:LotsManager.py:auto-install"
-UPDATER_CB_CONSENT = "lm_upd_consent"
+UPDATER_SETTINGS_SCHEMA = 2
 UPDATER_CB_TOGGLE = "lm_upd_toggle"
 UPDATER_CB_CHECK = "lm_upd_check"
+UPDATER_CB_STARTUP_DISABLE = "lm_upd_startup_disable"
+UPDATER_CB_STARTUP_SKIP = "lm_upd_startup_skip"
+UPDATER_CB_RESTART_NOW = "lm_upd_restart_now"
+UPDATER_RESTART_DELAY = 60 * 60
 
 
 # Callback'и для копирования
@@ -160,14 +165,18 @@ lots_cache = {
     "expires_at": 0.0
 }
 updater_lock = threading.Lock()
+restart_lock = threading.Lock()
+restart_requested = False
 updater_settings = {
-    "schema": 1,
-    "consent": "unknown",
-    "enabled": False,
+    "schema": UPDATER_SETTINGS_SCHEMA,
+    "enabled": True,
     "last_checked_at": 0,
     "last_commit": None,
     "last_version": None,
-    "consent_fingerprint": None,
+    "startup_notice_version": None,
+    "startup_notice_recipients": [],
+    "startup_notice_recipients_version": None,
+    "pending_restart": None,
 }
 
 
@@ -212,12 +221,109 @@ def validate_update_source(source: str) -> dict:
     return metadata
 
 
-def build_update_urls(commit_sha: str) -> tuple[str, str]:
+def parse_version_document(value: str) -> str:
+    """Validate the complete, small VERSION document."""
+    if not isinstance(value, str):
+        raise ValueError("invalid VERSION document")
+    version = value.strip()
+    if value not in {version, version + "\n"}:
+        raise ValueError("invalid VERSION document")
+    version_tuple(version)
+    return version
+
+
+def update_action(local_version: str, remote_version: str) -> str:
+    local, remote = version_tuple(local_version), version_tuple(remote_version)
+    return "install" if remote > local else ("current" if remote == local else "newer-local")
+
+
+def normalize_pending_restart(value) -> dict | None:
+    """Return a strictly validated persisted restart request."""
+    if not isinstance(value, dict) or set(value) != {"deadline", "from_version", "to_version"}:
+        return None
+    deadline = value.get("deadline")
+    if isinstance(deadline, bool) or not isinstance(deadline, int) or deadline <= 0:
+        return None
+    try:
+        if version_tuple(value.get("from_version")) >= version_tuple(value.get("to_version")):
+            return None
+    except ValueError:
+        return None
+    return {"deadline": deadline, "from_version": value["from_version"], "to_version": value["to_version"]}
+
+
+def pending_restart_token(value) -> tuple | None:
+    pending = normalize_pending_restart(value)
+    if pending is None:
+        return None
+    return pending["to_version"], pending["deadline"]
+
+
+def pending_restart_is_actionable(value, local_version: str) -> bool:
+    pending = normalize_pending_restart(value)
+    return pending is not None and version_tuple(pending["to_version"]) > version_tuple(local_version)
+
+
+def auto_update_allowed(enabled: bool, expected_generation: int, current_generation: int) -> bool:
+    return bool(enabled) and expected_generation == current_generation
+
+
+def normalize_recipient_ids(value) -> list[int]:
+    if not isinstance(value, list):
+        return []
+    result = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+            continue
+        if item not in result:
+            result.append(item)
+    return result
+
+
+def startup_notice_plan(snapshot, successful_recipients) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return normalized snapshot and recipients which still need this version's notice."""
+    normalized_snapshot = tuple(normalize_recipient_ids(list(snapshot) if isinstance(snapshot, (list, tuple)) else []))
+    successful = set(normalize_recipient_ids(successful_recipients))
+    return normalized_snapshot, tuple(user_id for user_id in normalized_snapshot if user_id not in successful)
+
+
+def build_update_urls(commit_sha: str) -> tuple[str, str, str]:
     if not re.fullmatch(r"[0-9a-f]{40}", str(commit_sha or "")):
         raise ValueError("invalid GitHub commit")
-    api_url = f"https://api.github.com/repos/{UPDATER_OWNER}/{UPDATER_REPO}/commits?path={UPDATER_SOURCE_PATH}&sha=main&per_page=1"
-    raw_url = f"https://raw.githubusercontent.com/{UPDATER_OWNER}/{UPDATER_REPO}/{commit_sha}/{UPDATER_SOURCE_PATH}"
-    return api_url, raw_url
+    api_url = f"https://api.github.com/repos/{UPDATER_OWNER}/{UPDATER_REPO}/commits?path={UPDATER_VERSION_PATH}&sha=main&per_page=1"
+    base = f"https://raw.githubusercontent.com/{UPDATER_OWNER}/{UPDATER_REPO}/{commit_sha}"
+    return api_url, f"{base}/{UPDATER_VERSION_PATH}", f"{base}/{UPDATER_SOURCE_PATH}"
+
+
+def normalize_updater_settings(loaded, now: int) -> dict:
+    """Migrate legacy settings while making fresh/migrated installations default-on."""
+    result = dict(updater_settings)
+    result.update({"schema": UPDATER_SETTINGS_SCHEMA, "enabled": True})
+    if not isinstance(loaded, dict):
+        loaded = {}
+    # Preserve explicit legacy decline; unknown legacy state and fresh installs become default-on.
+    if loaded.get("schema") == UPDATER_SETTINGS_SCHEMA and isinstance(loaded.get("enabled"), bool):
+        result["enabled"] = loaded["enabled"]
+    elif loaded.get("enabled") is False and loaded.get("consent") == "declined":
+        result["enabled"] = False
+    timestamp = loaded.get("last_checked_at", 0)
+    result["last_checked_at"] = timestamp if isinstance(timestamp, int) and 0 <= timestamp <= now + 300 else 0
+    commit = loaded.get("last_commit")
+    result["last_commit"] = commit if commit is None or re.fullmatch(r"[0-9a-f]{40}", str(commit)) else None
+    remote_version = loaded.get("last_version")
+    if remote_version is not None:
+        version_tuple(remote_version)
+    result["last_version"] = remote_version
+    notice = loaded.get("startup_notice_version")
+    result["startup_notice_version"] = notice if notice is None or re.fullmatch(r"\d+\.\d+\.\d+", str(notice)) else None
+    result["startup_notice_recipients"] = normalize_recipient_ids(loaded.get("startup_notice_recipients"))
+    # Recipient progress belongs only to the version named by the marker or the current partial attempt.
+    recipients_version = loaded.get("startup_notice_recipients_version")
+    if recipients_version is not None and not re.fullmatch(r"\d+\.\d+\.\d+", str(recipients_version)):
+        recipients_version = None
+    result["startup_notice_recipients_version"] = recipients_version
+    result["pending_restart"] = normalize_pending_restart(loaded.get("pending_restart"))
+    return result
 
 
 def sanitize_lot_fields(fields: dict, *, include_delivery_secrets: bool = False) -> dict:
@@ -570,65 +676,54 @@ def init_commands(cardinal: Cardinal):
         return
     tg = cardinal.telegram
     bot = cardinal.telegram.bot
+    updater_generation = {"value": 0}
+    restart_timer_state = {"timer": None, "token": None}
 
     def load_updater_settings():
-        if not exists(UPDATER_SETTINGS_FILE):
-            return
+        loaded = {}
         try:
-            with open(UPDATER_SETTINGS_FILE, "r", encoding="utf-8") as file:
-                loaded = json.load(file)
-            if not isinstance(loaded, dict):
-                raise ValueError("updater settings must be an object")
-            if loaded.get("schema") != 1 or loaded.get("consent_fingerprint") != UPDATER_CONSENT_FINGERPRINT:
-                raise ValueError("updater consent source changed")
-            if loaded.get("consent") in {"unknown", "accepted", "declined"}:
-                updater_settings["consent"] = loaded["consent"]
-            if isinstance(loaded.get("enabled"), bool):
-                updater_settings["enabled"] = loaded["enabled"]
-            timestamp = loaded.get("last_checked_at", 0)
-            if isinstance(timestamp, int) and 0 <= timestamp <= int(time.time()) + 300:
-                updater_settings["last_checked_at"] = timestamp
-            commit = loaded.get("last_commit")
-            if commit is None or re.fullmatch(r"[0-9a-f]{40}", str(commit)):
-                updater_settings["last_commit"] = commit
-            remote_version = loaded.get("last_version")
-            if remote_version is None:
-                updater_settings["last_version"] = None
-            else:
-                version_tuple(remote_version)
-                updater_settings["last_version"] = remote_version
-            updater_settings["consent_fingerprint"] = UPDATER_CONSENT_FINGERPRINT
-            if updater_settings["consent"] != "accepted":
-                updater_settings["enabled"] = False
+            if exists(UPDATER_SETTINGS_FILE):
+                with open(UPDATER_SETTINGS_FILE, "r", encoding="utf-8") as file:
+                    loaded = json.load(file)
+            updater_settings.clear()
+            updater_settings.update(normalize_updater_settings(loaded, int(time.time())))
         except (OSError, ValueError, json.JSONDecodeError):
-            logger.error("[LOTS UPDATER] Настройки повреждены; автообновления выключены.")
-            updater_settings.update({"consent": "unknown", "enabled": False})
+            logger.error("[LOTS UPDATER] Настройки повреждены; используются значения по умолчанию.")
+            updater_settings.clear()
+            updater_settings.update(normalize_updater_settings({}, int(time.time())))
 
     def save_updater_settings():
         atomic_write_json(UPDATER_SETTINGS_FILE, updater_settings)
 
-    def updater_consent_keyboard():
+    def authorized_user_ids() -> tuple[int, ...]:
+        result = []
+        for value in tuple(getattr(tg, "authorized_users", ()) or ()):
+            try:
+                result.append(int(value))
+            except (TypeError, ValueError):
+                logger.warning("[LOTS UPDATER] Пропущен некорректный authorized user: %r", value)
+        return tuple(dict.fromkeys(result))
+
+    def is_authorized_call(call) -> bool:
+        user_id = getattr(getattr(call, "from_user", None), "id", None)
+        if user_id not in authorized_user_ids():
+            try:
+                bot.answer_callback_query(call.id, "⛔ Недостаточно прав", show_alert=True)
+            except Exception:
+                logger.debug("[LOTS UPDATER] Не удалось отклонить callback.", exc_info=True)
+            return False
+        return True
+
+    def startup_keyboard(enabled: bool):
         keyboard = telebot.types.InlineKeyboardMarkup(row_width=2)
         keyboard.row(
-            telebot.types.InlineKeyboardButton("✅ Включить", callback_data=f"{UPDATER_CB_CONSENT}:yes"),
-            telebot.types.InlineKeyboardButton("🚫 Не включать", callback_data=f"{UPDATER_CB_CONSENT}:no")
+            telebot.types.InlineKeyboardButton(
+                "🚫 Выключить автообновления" if enabled else "✅ Включить автообновления",
+                callback_data=UPDATER_CB_STARTUP_DISABLE if enabled else UPDATER_CB_TOGGLE
+            ),
+            telebot.types.InlineKeyboardButton("✅ Пропустить", callback_data=UPDATER_CB_STARTUP_SKIP)
         )
         return keyboard
-
-    def ask_updater_consent(chat_id: int):
-        bot.send_message(
-            chat_id,
-            "🔄 <b>Автообновления LotsManager</b>\n\n"
-            "Разрешить плагину проверять публичный репозиторий GitHub и безопасно устанавливать новые версии?\n\n"
-            "Источник кода: <code>github.com/voterol/FpcLotsManager</code>. "
-            "Включая обновления, вы доверяете владельцу этого репозитория новый код плагина.\n\n"
-            "• обновляется только файл LotsManager.py;\n"
-            "• проверяются HTTPS-адрес, commit SHA, NAME, UUID и синтаксис;\n"
-            "• перед заменой создаётся резервная копия;\n"
-            "• новая версия запускается только после перезапуска Cardinal;\n"
-            "• настройку можно отключить в любое время командой /lots_update.",
-            parse_mode="HTML", reply_markup=updater_consent_keyboard()
-        )
 
     def resolve_plugin_path() -> Path:
         plugin_data = cardinal.plugins.get(UUID)
@@ -653,43 +748,56 @@ def init_commands(cardinal: Cardinal):
             raise RuntimeError("ответ GitHub API слишком большой")
         return json.loads(payload.decode("utf-8"))
 
-    def fetch_limited_source(url: str) -> str:
+    def fetch_limited_source(url: str, max_bytes: int = UPDATER_MAX_BYTES) -> str:
         request = Request(url, headers={"Accept": "text/plain", "User-Agent": "LotsManager-Updater"})
         with urlopen(request, timeout=20) as response:
             if response.geturl() != url:
                 raise RuntimeError("GitHub Raw перенаправил запрос")
             content_length = response.headers.get("Content-Length")
-            if content_length and int(content_length) > UPDATER_MAX_BYTES:
+            if content_length and int(content_length) > max_bytes:
                 raise RuntimeError("файл обновления слишком большой")
-            payload = response.read(UPDATER_MAX_BYTES + 1)
-        if len(payload) > UPDATER_MAX_BYTES:
+            payload = response.read(max_bytes + 1)
+        if len(payload) > max_bytes:
             raise RuntimeError("файл обновления слишком большой")
         return payload.decode("utf-8")
 
-    def check_and_install_update() -> dict:
+    def check_and_install_update(auto_generation: int | None = None) -> dict:
         if not updater_lock.acquire(blocking=False):
             return {"status": "busy"}
         try:
-            api_url, _ = build_update_urls("0" * 40)
+            def auto_cancelled() -> bool:
+                return auto_generation is not None and not auto_update_allowed(
+                    updater_settings.get("enabled", False), auto_generation, updater_generation["value"]
+                )
+
+            if auto_cancelled():
+                return {"status": "cancelled"}
+            api_url, _, _ = build_update_urls("0" * 40)
             commits = fetch_limited_json(api_url)
             if not isinstance(commits, list) or not commits:
                 raise RuntimeError("GitHub не вернул историю файла")
             if not isinstance(commits[0], dict):
                 raise RuntimeError("GitHub вернул некорректный commit")
             commit_sha = str(commits[0].get("sha") or "")
-            _, raw_url = build_update_urls(commit_sha)
-            source = fetch_limited_source(raw_url)
-            metadata = validate_update_source(source)
-            if (updater_settings.get("last_commit") == commit_sha and
-                    updater_settings.get("last_version") == metadata["VERSION"]):
-                return {"status": "current", "version": metadata["VERSION"]}
-            if version_tuple(metadata["VERSION"]) <= version_tuple(VERSION):
+            _, version_url, source_url = build_update_urls(commit_sha)
+            remote_version = parse_version_document(fetch_limited_source(version_url, 128))
+            action = update_action(VERSION, remote_version)
+            if action != "install":
                 updater_settings.update({
                     "last_checked_at": int(time.time()), "last_commit": commit_sha,
-                    "last_version": metadata["VERSION"],
+                    "last_version": remote_version,
                 })
                 save_updater_settings()
-                return {"status": "current", "version": metadata["VERSION"]}
+                return {"status": action, "version": remote_version}
+
+            pending = normalize_pending_restart(updater_settings.get("pending_restart"))
+            if pending and pending["to_version"] == remote_version:
+                return {"status": "pending", "version": remote_version, "deadline": pending["deadline"]}
+
+            source = fetch_limited_source(source_url)
+            metadata = validate_update_source(source)
+            if metadata["VERSION"] != remote_version:
+                raise RuntimeError("VERSION не совпадает с metadata LotsManager.py")
 
             target = resolve_plugin_path()
             current_bytes = target.read_bytes()
@@ -697,6 +805,7 @@ def init_commands(cardinal: Cardinal):
             validate_update_source(current_source)
             backup = target.with_name(f"{target.name}.backup-{VERSION}-{token_hex(6)}")
             temp_path = None
+            previous_settings = dict(updater_settings)
             try:
                 shutil.copy2(target, backup)
                 if hashlib.sha256(backup.read_bytes()).hexdigest() != hashlib.sha256(current_bytes).hexdigest():
@@ -711,10 +820,23 @@ def init_commands(cardinal: Cardinal):
                     temp_path = Path(temp.name)
                 if hashlib.sha256(temp_path.read_bytes()).hexdigest() != hashlib.sha256(source_bytes).hexdigest():
                     raise RuntimeError("контрольная сумма временного файла не совпала")
+                if auto_cancelled():
+                    return {"status": "cancelled"}
                 replace(str(temp_path), str(target))
                 temp_path = None
                 validate_update_source(target.read_text(encoding="utf-8"))
+                updater_settings.update({
+                    "last_checked_at": int(time.time()), "last_commit": commit_sha,
+                    "last_version": remote_version,
+                    "pending_restart": {
+                        "deadline": int(time.time()) + UPDATER_RESTART_DELAY,
+                        "from_version": VERSION, "to_version": remote_version,
+                    },
+                })
+                save_updater_settings()
             except Exception:
+                updater_settings.clear()
+                updater_settings.update(previous_settings)
                 if backup.exists():
                     rollback_temp = None
                     try:
@@ -734,57 +856,170 @@ def init_commands(cardinal: Cardinal):
             finally:
                 if temp_path and temp_path.exists():
                     temp_path.unlink()
-            updater_settings.update({
-                "last_checked_at": int(time.time()), "last_commit": commit_sha,
-                "last_version": metadata["VERSION"],
-            })
-            save_updater_settings()
-            return {"status": "installed", "version": metadata["VERSION"], "backup": str(backup)}
+            return {"status": "installed", "version": remote_version, "old_version": VERSION, "backup": str(backup)}
         finally:
             updater_lock.release()
 
     def updater_result_text(result: dict) -> str:
         status = result.get("status")
         if status == "installed":
-            return f"✅ Установлена версия <b>{html_text(result['version'])}</b>. Перезапустите Cardinal командой /restart."
+            return (f"✅ LotsManager обновлён: <b>{html_text(result['old_version'])}</b> → "
+                    f"<b>{html_text(result['version'])}</b>. Перезапуск запланирован через 1 час.")
         if status == "current":
             return f"✅ Установлена актуальная версия <b>{html_text(VERSION)}</b>."
+        if status == "newer-local":
+            return f"✅ Локальная версия <b>{html_text(VERSION)}</b> новее опубликованной; downgrade отменён."
         if status == "busy":
             return "⏳ Проверка обновлений уже выполняется."
+        if status == "pending":
+            return f"⏳ Версия <b>{html_text(result['version'])}</b> уже установлена и ожидает перезапуска."
+        if status == "cancelled":
+            return "🚫 Автоматическое обновление отменено: автообновления выключены."
         return "❌ Неизвестный результат проверки."
 
-    def maybe_auto_update(chat_id: int):
-        if updater_settings.get("consent") != "accepted" or not updater_settings.get("enabled"):
+    def restart_keyboard():
+        keyboard = telebot.types.InlineKeyboardMarkup()
+        keyboard.row(telebot.types.InlineKeyboardButton("🔄 Перезапустить сейчас", callback_data=UPDATER_CB_RESTART_NOW))
+        return keyboard
+
+    def notify_installed(result: dict):
+        for user_id in authorized_user_ids():
+            try:
+                bot.send_message(user_id, updater_result_text(result), parse_mode="HTML", reply_markup=restart_keyboard())
+            except Exception:
+                logger.warning("[LOTS UPDATER] Не удалось уведомить пользователя %s.", user_id, exc_info=True)
+        schedule_pending_restart()
+
+    def maybe_auto_update():
+        if not updater_settings.get("enabled"):
             return
         if time.time() - float(updater_settings.get("last_checked_at") or 0) < UPDATER_CHECK_INTERVAL:
             return
+        generation = updater_generation["value"]
         def worker():
             try:
-                result = check_and_install_update()
+                result = check_and_install_update(generation)
                 if result.get("status") == "installed":
-                    bot.send_message(chat_id, updater_result_text(result), parse_mode="HTML")
+                    notify_installed(result)
             except Exception as exc:
                 logger.error("[LOTS UPDATER] Автопроверка не удалась: %s", exc, exc_info=True)
         threading.Thread(target=worker, name="LotsManagerUpdater", daemon=True).start()
 
-    def gate_first_use(message) -> bool:
-        if updater_settings.get("consent") == "unknown":
-            ask_updater_consent(message.chat.id)
-            return False
-        maybe_auto_update(message.chat.id)
-        return True
-
     load_updater_settings()
 
-    def is_unconsented_plugin_callback(call) -> bool:
-        data = str(getattr(call, "data", "") or "")
-        is_plugin_callback = data.startswith(("ml_", "mm_", "lots_copy_plugin."))
-        return updater_settings.get("consent") == "unknown" and is_plugin_callback
+    def perform_restart(expected_token=None):
+        global restart_requested
+        if not restart_lock.acquire(blocking=False):
+            return
+        try:
+            pending = normalize_pending_restart(updater_settings.get("pending_restart"))
+            current_token = pending_restart_token(pending)
+            if (restart_requested or not pending_restart_is_actionable(pending, VERSION) or
+                    (expected_token is not None and expected_token != current_token) or
+                    (expected_token is not None and int(time.time()) < pending["deadline"])):
+                return
+            # Keep the deadline persisted until the new version starts; the in-process flag makes calls idempotent.
+            restart_requested = True
+            cardinal_tools.restart_program()
+        except Exception:
+            restart_requested = False
+            logger.error("[LOTS UPDATER] Не удалось перезапустить Cardinal.", exc_info=True)
+        finally:
+            restart_lock.release()
 
-    @bot.callback_query_handler(func=is_unconsented_plugin_callback)
-    def callback_first_use_consent(call):
-        bot.answer_callback_query(call.id, "Сначала выберите настройку обновлений")
-        ask_updater_consent(call.message.chat.id)
+    def schedule_pending_restart():
+        pending = normalize_pending_restart(updater_settings.get("pending_restart"))
+        old_timer = restart_timer_state.get("timer")
+        if old_timer is not None:
+            old_timer.cancel()
+        restart_timer_state.update({"timer": None, "token": None})
+        if pending is None:
+            return
+        if not pending_restart_is_actionable(pending, VERSION):
+            updater_settings["pending_restart"] = None
+            save_updater_settings()
+            return
+        token = pending_restart_token(pending)
+        delay = max(0, int(pending["deadline"]) - int(time.time()))
+        timer = threading.Timer(delay, perform_restart, args=(token,))
+        timer.name = "LotsManagerPendingRestart"
+        timer.daemon = True
+        restart_timer_state.update({"timer": timer, "token": token})
+        timer.start()
+
+    def send_startup_notice(schedule_auto_after: bool = False):
+        def schedule_delayed_auto_update():
+            if not schedule_auto_after:
+                return
+            auto_timer = threading.Timer(8.0, maybe_auto_update)
+            auto_timer.name = "LotsManagerDelayedAutoUpdate"
+            auto_timer.daemon = True
+            auto_timer.start()
+
+        recipients_version = updater_settings.get("startup_notice_recipients_version")
+        # A legacy completed marker has no per-recipient history; trust it rather than duplicate notices.
+        if updater_settings.get("startup_notice_version") == VERSION and recipients_version != VERSION:
+            schedule_delayed_auto_update()
+            return
+        user_ids, pending_user_ids = startup_notice_plan(
+            authorized_user_ids(),
+            updater_settings.get("startup_notice_recipients", [])
+            if recipients_version == VERSION else [],
+        )
+        if not user_ids:
+            schedule_delayed_auto_update()
+            return
+        if not pending_user_ids:
+            updater_settings["startup_notice_version"] = VERSION
+            try:
+                save_updater_settings()
+            except Exception:
+                logger.error("[LOTS UPDATER] Не удалось сохранить startup marker.", exc_info=True)
+            schedule_delayed_auto_update()
+            return
+        enabled = bool(updater_settings.get("enabled"))
+        text = (
+            "🎉 <b>LotsManager успешно загружен!</b>\n\n"
+            f"Версия: <b>{html_text(VERSION)}</b>\n"
+            + ("🔄 Автообновления включены и работают в фоне. Команды уже доступны."
+               if enabled else "🚫 Автообновления выключены. Команды доступны; включить обновления можно ниже.")
+        )
+        successful = normalize_recipient_ids(
+            updater_settings.get("startup_notice_recipients", [])
+            if updater_settings.get("startup_notice_recipients_version") == VERSION else []
+        )
+        failed = False
+        for user_id in pending_user_ids:
+            try:
+                bot.send_message(user_id, text, parse_mode="HTML", reply_markup=startup_keyboard(enabled))
+                successful.append(user_id)
+                updater_settings["startup_notice_recipients_version"] = VERSION
+                updater_settings["startup_notice_recipients"] = normalize_recipient_ids(successful)
+                save_updater_settings()
+            except Exception:
+                failed = True
+                logger.warning("[LOTS UPDATER] Не удалось отправить startup notice пользователю %s.", user_id, exc_info=True)
+        if not failed and all(user_id in successful for user_id in user_ids):
+            updater_settings["startup_notice_version"] = VERSION
+            try:
+                save_updater_settings()
+            except Exception:
+                logger.error("[LOTS UPDATER] Не удалось сохранить startup marker.", exc_info=True)
+        schedule_delayed_auto_update()
+
+    if (normalize_pending_restart(updater_settings.get("pending_restart")) is not None and
+            not pending_restart_is_actionable(updater_settings["pending_restart"], VERSION)):
+        updater_settings["pending_restart"] = None
+        save_updater_settings()
+    else:
+        schedule_pending_restart()
+    startup_notice_completed = updater_settings.get("startup_notice_version") == VERSION
+    startup_timer = threading.Timer(7.0, send_startup_notice, args=(not startup_notice_completed,))
+    startup_timer.name = "LotsManagerStartupNotice"
+    startup_timer.daemon = True
+    startup_timer.start()
+    if startup_notice_completed:
+        maybe_auto_update()
 
     def format_seconds(seconds: float) -> str:
         seconds = max(int(seconds), 0)
@@ -4990,38 +5225,49 @@ def init_commands(cardinal: Cardinal):
             logger.exception("TRACEBACK:")
             bot.send_message(m.chat.id, f"❌ Произошла ошибка: {str(e)}")
 
-    @bot.callback_query_handler(func=lambda c: c.data.startswith(f"{UPDATER_CB_CONSENT}:"))
-    def callback_updater_consent(call):
-        answer = call.data.rsplit(":", 1)[1]
-        updater_settings["consent"] = "accepted" if answer == "yes" else "declined"
-        updater_settings["enabled"] = answer == "yes"
-        updater_settings["consent_fingerprint"] = UPDATER_CONSENT_FINGERPRINT
+    @bot.callback_query_handler(func=lambda c: c.data == UPDATER_CB_STARTUP_DISABLE)
+    def callback_updater_startup_disable(call):
+        if not is_authorized_call(call):
+            return
+        updater_settings["enabled"] = False
+        updater_generation["value"] += 1
         save_updater_settings()
-        bot.answer_callback_query(call.id, "Настройка сохранена")
+        bot.answer_callback_query(call.id, "🚫 Автообновления выключены")
         bot.edit_message_text(
-            "✅ Автообновления включены. Повторите нужную команду."
-            if answer == "yes" else
-            "🚫 Автообновления выключены. Повторите нужную команду; плагин продолжит работать без сетевых проверок.",
+            "✅ LotsManager успешно загружен.\n\n🚫 Автообновления выключены глобально.",
             call.message.chat.id, call.message.message_id
         )
 
+    @bot.callback_query_handler(func=lambda c: c.data == UPDATER_CB_STARTUP_SKIP)
+    def callback_updater_startup_skip(call):
+        if not is_authorized_call(call):
+            return
+        bot.answer_callback_query(
+            call.id,
+            "✅ Автообновления оставлены включёнными"
+            if updater_settings.get("enabled") else "🚫 Автообновления остаются выключенными"
+        )
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+
     @bot.callback_query_handler(func=lambda c: c.data == UPDATER_CB_TOGGLE)
     def callback_updater_toggle(call):
+        if not is_authorized_call(call):
+            return
         enabled = not updater_settings.get("enabled", False)
-        updater_settings["consent"] = "accepted" if enabled else "declined"
         updater_settings["enabled"] = enabled
-        updater_settings["consent_fingerprint"] = UPDATER_CONSENT_FINGERPRINT
+        updater_generation["value"] += 1
         save_updater_settings()
         bot.answer_callback_query(call.id, "✅ Автообновления включены" if enabled else "🚫 Автообновления выключены")
         bot.edit_message_text(
             render_manage_menu_text("settings"), call.message.chat.id, call.message.message_id,
             parse_mode="HTML", reply_markup=create_manage_menu_keyboard("settings")
         )
+        if enabled:
+            maybe_auto_update()
 
     @bot.callback_query_handler(func=lambda c: c.data == UPDATER_CB_CHECK)
     def callback_updater_check(call):
-        if updater_settings.get("consent") != "accepted":
-            bot.answer_callback_query(call.id, "Сначала включите автообновления")
+        if not is_authorized_call(call):
             return
         bot.answer_callback_query(call.id, "⏳ Проверяю GitHub...")
         status = bot.send_message(call.message.chat.id, "⏳ Проверяю обновления LotsManager...")
@@ -5029,6 +5275,8 @@ def init_commands(cardinal: Cardinal):
             try:
                 result = check_and_install_update()
                 text = updater_result_text(result)
+                if result.get("status") == "installed":
+                    notify_installed(result)
             except Exception as exc:
                 logger.error("[LOTS UPDATER] Ручная проверка не удалась: %s", exc, exc_info=True)
                 text = "❌ Обновление не установлено. Проверьте подключение и логи Cardinal."
@@ -5038,10 +5286,18 @@ def init_commands(cardinal: Cardinal):
                 logger.debug("[LOTS UPDATER] Не удалось обновить статусное сообщение.", exc_info=True)
         threading.Thread(target=worker, name="LotsManagerManualUpdater", daemon=True).start()
 
-    def lots_update_command(m: Message):
-        if updater_settings.get("consent") == "unknown":
-            ask_updater_consent(m.chat.id)
+    @bot.callback_query_handler(func=lambda c: c.data == UPDATER_CB_RESTART_NOW)
+    def callback_updater_restart_now(call):
+        if not is_authorized_call(call):
             return
+        pending = normalize_pending_restart(updater_settings.get("pending_restart"))
+        if pending is None:
+            bot.answer_callback_query(call.id, "Перезапуск уже выполнен или отменён", show_alert=True)
+            return
+        bot.answer_callback_query(call.id, "🔄 Перезапускаю Cardinal...")
+        threading.Thread(target=perform_restart, name="LotsManagerRestartNow", daemon=True).start()
+
+    def lots_update_command(m: Message):
         keyboard = telebot.types.InlineKeyboardMarkup(row_width=2)
         keyboard.row(
             telebot.types.InlineKeyboardButton(
@@ -5059,8 +5315,6 @@ def init_commands(cardinal: Cardinal):
 
     def gate_handler(handler):
         def wrapped(message, *args, **kwargs):
-            if not gate_first_use(message):
-                return None
             return handler(message, *args, **kwargs)
         return wrapped
 
